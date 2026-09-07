@@ -4,14 +4,30 @@
 //
 // The first real graphics output in this project: the video
 // generator's plane 0 (tag list, palette, horizontal scale) is
-// entirely PPU-owned (see gfourppu.c). Pixel data itself lives in
-// RT-11's own default console screen memory (plane offset 0100000,
-// shared by planes 0/1/2 -- see gfourppu.c's own header comment for
-// how that address was found and why it's safe to take over), which
-// is outside the CPU's normal address space -- reached here through
-// this side's own address/data window ports (0176640/0176642) rather
-// than a plain pointer, exactly like gfourppu.c does from its own
-// side.
+// entirely PPU-owned (see gfourppu.c). Pixel data lives in an ordinary
+// malloc()ed buffer of this program's own (`screen` below), written
+// through a plain pointer: the CPU's whole RAM *is* video planes 1/2
+// interleaved (CPU byte 2N = plane1[N], 2N+1 = plane2[N] -- confirmed
+// against ukncbtl's emubase/Memory.cpp, ADDRTYPE_RAM12 for every
+// address below 0160000), and the PPU's tag list can point a scanline
+// at any plane offset at all, so the buffer's address / 2 is all the
+// PPU needs to display it -- sent over once, right after ppuc_run()
+// (see main()). Two shipped UKNC games do exactly this
+// (blairecas/bolder, aberranthacker/soft_scroll_test), and so does
+// this project's own Digger port, where it replaced the version of
+// this scheme this file used first: pixels in RT-11's own console
+// screen memory at plane offset 0100000 -- above the CPU's directly
+// addressable range -- reached one word at a time through the
+// address/data window ports 0176640/0176642, two I/O writes (and, for
+// a read-modify-write, a read) per word. The ports are gone from this
+// file now; gfourppu.c's header comment keeps the account of that
+// address.
+//
+// Digger has to split its screen (HUD through the ports, playfield in
+// a heap buffer) and move its stack out of the way; this program is
+// small enough that the full 288-line buffer (23040 bytes) fits between
+// its own _end and the stack RT-11 gave it, so none of that is needed
+// here.
 //
 // Keypresses reach this side via libppu's own channel-1 PPU->CPU
 // messaging (ppuc_recv_init(), see ppu_client.h) instead of any kind
@@ -44,6 +60,7 @@
 // mechanism below already covers everything it needs from the
 // keyboard -- exactly why that has its own, non-console channel.
 
+#include <stdlib.h>
 #include <unistd.h>
 
 #include "ppu_client.h"
@@ -53,8 +70,12 @@
 #define SCREEN_H 288
 #define LINE_WORDS                                                             \
   (SCREEN_W / 8) /* one word = 8px: low byte plane 1, high byte plane 2 */
-#define SCREEN_BASE                                                            \
-  0100000 /* plane offset -- see gfourppu.c's header comment */
+
+// The byte gfourppu.c sends back once it has handed the console over
+// to RT-11 again (see its ppu_main()) -- distinguishable from any
+// scancode, press (bit 7 clear) or release (row number, bit 7 set).
+// Must match gfourppu.c's own definition.
+#define PPU_MSG_BYE 0377
 
 #define SQ_WIDTH 24 /* square width, in pixels */
 #define SQ_ROWS 24  /* square height, in pixels */
@@ -70,7 +91,8 @@
 // waits for this to advance by 2 (a full ~40ms video frame, not just
 // one ~20ms half of one) before returning.
 //
-// Just one tick wasn't enough headroom: fill_rect_px()'s per-pixel
+// Just one tick wasn't enough headroom back when every screen word
+// went through the window ports: fill_rect_px()'s per-pixel
 // horizontal positioning needs a read-modify-write for every
 // partially-covered edge byte (see its own comment), which made a
 // single square's erase-move-draw noticeably heavier than the
@@ -79,7 +101,9 @@
 // same symptom as the original no-vsync-at-all version, meaning
 // drawing was again finishing mid-scan on at least some frames rather
 // than safely inside the blanking gap. Waiting a full frame instead
-// of a half doubles that gap.
+// of a half doubles that gap. The plain-pointer buffer is far cheaper
+// per word; the full-frame wait stays because it's the right pacing
+// anyway.
 static volatile unsigned int vsync_count;
 
 // The interrupt entry point (vsync_tick itself, declared by this same
@@ -140,6 +164,11 @@ static void wait_vsync(void) {
 // ppuc_recv_init() itself) and read from ordinary foreground code.
 static volatile int any_key_pressed;
 
+// Set by kbd_recv() on PPU_MSG_BYE: gfourppu.c has restored RT-11's
+// tag list, keyboard vector and channel-2 receiver, so RT-11 can be
+// talked to (i.e. this program can exit) again -- see main().
+static volatile int ppu_bye;
+
 // gfourppu.c's own keyboard ISR forwards every scancode, press and
 // release alike (see its own header comment for the format: a press
 // carries the full 7-bit code with bit 7 clear, a release carries
@@ -153,7 +182,12 @@ static volatile int any_key_pressed;
 static void kbd_recv(const void *buf, unsigned int size) {
   const unsigned char *p = (const unsigned char *)buf;
 
-  if (size >= 1 && (p[0] & 0200) == 0) {
+  if (size < 1) {
+    return;
+  }
+  if (p[0] == PPU_MSG_BYE) {
+    ppu_bye = 1;
+  } else if ((p[0] & 0200) == 0) {
     any_key_pressed = 1;
   }
 }
@@ -179,23 +213,16 @@ static unsigned int next_rand(void) {
   return (rng_state >> 6);
 }
 
-// Writes one word (8 pixels: low byte plane 1, high byte plane 2) to
-// screen memory at plane offset `addr` through this side's own
-// address/data window ports -- see the file header comment for why a
-// plain pointer can't reach this memory.
-static void write_screen_word(unsigned int addr, unsigned short word) {
-  *(volatile unsigned short *)0176640 = (unsigned short)addr;
-  *(volatile unsigned short *)0176642 = word;
-}
+// The screen: SCREEN_H lines of LINE_WORDS words (8 pixels each: low
+// byte plane 1, high byte plane 2), malloc()ed by main() -- see the
+// file header comment for why an ordinary heap buffer *is* video
+// memory here, and how the PPU learns where it is. volatile: the video
+// generator reads it behind the compiler's back, so every store must
+// really happen, in order.
+static volatile unsigned short *screen;
 
-// Reads one word back from screen memory at plane offset `addr` --
-// same address/data window ports as write_screen_word(), just read
-// instead of written; needed by fill_rect_px() below to preserve
-// whatever's outside a square's own edge within a byte it only
-// partially covers.
-static unsigned short read_screen_word(unsigned int addr) {
-  *(volatile unsigned short *)0176640 = (unsigned short)addr;
-  return *(volatile unsigned short *)0176642;
+static volatile unsigned short *screen_line(unsigned int row) {
+  return screen + row * LINE_WORDS;
 }
 
 // color: 0-3 (bit 0 -> plane 1, bit 1 -> plane 2); 0 is black, used
@@ -205,22 +232,19 @@ static unsigned short color_word(unsigned int color) {
          (unsigned short)((color & 2) ? 0xff00 : 0);
 }
 
-// Zeroes planes 1/2 across the whole screen -- called once at the very
-// start (planes 1/2 still hold whatever RT-11's own console last drew
-// there; this memory is otherwise ordinary video RAM, not cleared by
-// gfourppu.c's own build_tags(), which only ever touches plane 0 --
-// see its header comment), and again right before this program exits,
-// so gfourppu.c's own clear_screen()/restore_tag0() (plane 0 only, see
-// its own comment) hands back a genuinely blank console instead of one
-// with this program's last-drawn squares still showing through RT-11's
-// own restored palette.
+// Zeroes the whole screen buffer -- called once at the very start:
+// fresh from malloc() it holds whatever the heap held before (mostly
+// the .PPU file ppuc_load_code() just read and freed). Nothing needs
+// clearing on the way out any more: RT-11's own console memory is
+// never written by this program now, so its screen comes back exactly
+// as it was left -- gfourppu.c only ever redirected the tag list away
+// from it and back.
 static void clear_screen(void) {
-  unsigned int row, col;
+  unsigned int n = (unsigned int)SCREEN_H * LINE_WORDS;
+  volatile unsigned short *p = screen;
 
-  for (row = 0; row < SCREEN_H; row++) {
-    for (col = 0; col < LINE_WORDS; col++) {
-      write_screen_word(SCREEN_BASE + row * LINE_WORDS + col, 0);
-    }
+  while (n-- != 0) {
+    *p++ = 0;
   }
 }
 
@@ -239,24 +263,20 @@ static void fill_rect_px(int x, int row0, unsigned int color) {
   int r, bc;
 
   for (r = 0; r < SQ_ROWS; r++) {
-    unsigned int line_base =
-        SCREEN_BASE + (unsigned int)(row0 + r) * LINE_WORDS;
+    volatile unsigned short *line = screen_line((unsigned int)(row0 + r));
 
     for (bc = byte_lo; bc <= byte_hi; bc++) {
       int bit_start = (bc == byte_lo) ? (x & 7) : 0;
       int bit_end = (bc == byte_hi) ? ((x + SQ_WIDTH - 1) & 7) : 7;
 
       if (bit_start == 0 && bit_end == 7) {
-        write_screen_word(line_base + (unsigned int)bc, word);
+        line[bc] = word;
       } else {
         unsigned short bitmask =
             (unsigned short)(((2 << bit_end) - 1) & ~((1 << bit_start) - 1));
         unsigned short fullmask = (unsigned short)(bitmask | (bitmask << 8));
-        unsigned short old = read_screen_word(line_base + (unsigned int)bc);
 
-        write_screen_word(
-            line_base + (unsigned int)bc,
-            (unsigned short)((old & ~fullmask) | (word & fullmask)));
+        line[bc] = (unsigned short)((line[bc] & ~fullmask) | (word & fullmask));
       }
     }
   }
@@ -319,6 +339,7 @@ int main(void) {
   long ppu_addr;
   struct square sq[NUM_SQUARES];
   unsigned int i, frame;
+  unsigned short screen_base;
 
   msg("gfour: loading GFPPU.PPU...\r\n");
   ppu_addr = ppuc_load_code("GFPPU.PPU");
@@ -326,6 +347,18 @@ int main(void) {
     msg("gfour: ppuc_load_code failed\r\n");
     return 1;
   }
+
+  // The screen buffer -- after ppuc_load_code() (the only other
+  // malloc() user, whose freed file buffer this then reuses) and
+  // before ppuc_run() (while the console still works, so a failure can
+  // still say so). malloc() returns even addresses, so the plane
+  // offset is exactly address / 2 -- see the file header comment.
+  screen = malloc((unsigned int)SCREEN_H * LINE_WORDS * 2);
+  if (screen == NULL) {
+    msg("gfour: no memory for the screen buffer\r\n");
+    return 1;
+  }
+  screen_base = (unsigned short)((unsigned int)screen >> 1);
 
   /* 1/2/3 -> palette slots 2/4/6 (see gfourppu.c): green, red, white. */
   init_square(&sq[0], 1);
@@ -338,21 +371,24 @@ int main(void) {
     return 1;
   }
 
+  // Tell the PPU where the screen is; it can't build its tag list
+  // before it knows. This first ppuc_send() also blocks until
+  // gfourppu.c's own ppus_recv_init() has taken over from the resident
+  // monitor (the handshake ppu_client.h describes) -- which is exactly
+  // why it has to come *before* ppuc_recv_init() below: that same
+  // handshake byte arrives on the channel ppuc_recv_init() would
+  // otherwise start reading, and would be taken for a scancode.
+  ppuc_send(&screen_base, sizeof screen_base);
+
   // Arms kbd_recv() for every scancode gfourppu.c's own keyboard ISR
-  // forwards from here on (see that file's header comment) -- no
-  // handshake wait before this, unlike ppuc_send() elsewhere in this
-  // project: that wait only matters when the PPU program itself also
-  // calls ppus_recv_init() (the opposite direction), which gfourppu.c
-  // never does.
+  // forwards from here on (see that file's header comment).
   ppuc_recv_init(kbd_recv);
 
-  // No console output from here on, ever again: RT-11's own text
-  // console draws character bitmaps into the same screen memory this
-  // program's own tag list (see gfourppu.c) now controls the meaning
-  // of -- confirmed directly, printing anything here corrupts the
-  // screen with moving, color-cycling text-shaped noise (the cursor
-  // blink included), since the console driver has no idea the tag
-  // list it's still implicitly relying on was just replaced.
+  // No console output from here until gfourppu.c has handed the
+  // console back (ppu_bye below): the PPU-resident monitor that
+  // services RT-11's console requests isn't running while gfourppu.c
+  // is -- every write() attempted in between has been observed to
+  // block, possibly forever (see the file header comment).
 
   clear_screen();
 
@@ -373,7 +409,18 @@ int main(void) {
       fill_rect_px(sq[i].x, sq[i].row, sq[i].color);
     }
   }
-  clear_screen();
+
+  // gfourppu.c saw the same key press and is handing the console back
+  // on its own (see its ppu_main()); wait for its bye before touching
+  // RT-11 again -- an .EXIT that raced ahead of it would have its
+  // first request to the PPU swallowed by gfourppu.c's still-armed
+  // channel-2 receiver, and RMON would wait for the answer forever
+  // (seen exactly so in the Digger port). On the NUM_FRAMES safety
+  // path no key was pressed, so gfourppu.c is still running: nothing
+  // will ever say bye, and this hangs -- the same "no orderly way out
+  // without a keypress" this example has always had, just moved here.
+  while (!ppu_bye) {
+  }
   vsync_shutdown();
   ppuc_recv_shutdown();
 

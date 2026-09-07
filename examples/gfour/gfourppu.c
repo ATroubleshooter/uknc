@@ -1,7 +1,9 @@
 // gfourppu.c -- PPU-side payload for the gfour example
 //
-// Builds a video display tag list in plane 0 pointing at RT-11's own
-// default console screen memory (plane-offset 0100000, see below), then
+// Waits for gfour.c to say where its screen buffer is (one 2-byte
+// message: the buffer's plane offset -- see gfour.c's header comment
+// for why a CPU heap buffer is video memory), builds a video display
+// tag list in plane 0 pointing every visible scanline at it, then
 // stays resident -- its own keyboard interrupt handler (see kbd_init()
 // below) needs to stay installed for as long as gfour.c's own animation
 // loop is still running -- but, unlike a program meant to stay resident
@@ -9,16 +11,16 @@
 // the lifetime of one gfour demo: the moment its own keyboard ISR sees
 // an actual key press (not
 // just a release -- same criterion as gfour.c's own kbd_recv()), it
-// forwards that event to the CPU as usual, then blanks the screen and
-// hands the *video* console back too (clear_screen()/restore_tag0()
-// below -- see restore_tag0()'s own comment for why one saved tag is
-// all that takes), restores vector 0300 to whatever the PPU-resident
-// monitor had there before (kbd_shutdown() below), and returns from
-// ppu_main(), letting ppus_start.c's own shim free this program's PPU
-// memory block and hand control back to the resident monitor (see
-// ppu_server.h's own ppus_exit() comment) -- exactly the same
-// reasoning gfour.c's own vsync_init()/vsync_shutdown() pair already
-// follows on the CPU side. Without the vector restore, an earlier
+// forwards that event to the CPU as usual, then hands the *video*
+// console back (restore_tag0() below -- see its own comment for why
+// one saved tag is all that takes), restores vector 0300 to whatever
+// the PPU-resident monitor had there before (kbd_shutdown() below),
+// drops its channel-2 receiver, tells the CPU so (PPU_MSG_BYE), and
+// returns from ppu_main(), letting ppus_start.c's own shim free this
+// program's PPU memory block and hand control back to the resident
+// monitor (see ppu_server.h's own ppus_exit() comment) -- exactly the
+// same reasoning gfour.c's own vsync_init()/vsync_shutdown() pair
+// already follows on the CPU side. Without the vector restore, an earlier
 // version of this file left vector 0300 permanently pointing at this
 // program's own (about-to-be-stale) kbd_recv_byte and never gave
 // control back to the resident monitor at all: gfour.c's own animation
@@ -76,26 +78,30 @@
 // tag 0, fixed at 0000270, only ever redirects into the real list
 // below, at a separate fixed address (TAG_LIST_BASE).
 //
-// Where the pixels themselves live -- SCREEN_BASE = 0100000 (plane
-// offset, all 3 planes): this is RT-11's own real console text
-// screen, found by decoding the live default tag list at boot
-// (confirmed independently by 3 real UKNC games that also run under
-// RT-11 -- nzeemin/uknc-highwayencounter, uknc-loderunner,
-// uknc-desolate -- all writing their own graphics to this exact same
-// address the exact same way). Deliberately reused instead of a
-// CPU-array-derived address (this file's own earlier version): plane
-// offsets >= 0100000 are outside BOTH processors' direct/normal
-// address space (CPU's own RAM12 window only reaches plane-offsets
-// below 0070000; the PPU's own direct plane-0 access stops at 077777
-// -- confirmed against ukncbtl-qt/emulator/emubase/Memory.cpp's
-// TranslateAddress logic for each side) -- which is exactly *why* the
-// PPU-resident monitor never stores anything of its own there: it's
-// pure video memory, genuinely safe to overwrite and to zero, unlike
-// the low plane-0 range an earlier version of this file zeroed and
-// crashed the monitor by doing so. Reaching it at all needs each
-// side's own window-register ports rather than a plain pointer --
-// see poke0_screen() below for the PPU side, gfour.c for the CPU
-// side.
+// Where the pixels themselves live: in gfour.c's own malloc()ed buffer,
+// at plane offset (CPU address / 2), received from the CPU at startup
+// (see ppu_main()) -- the visible tags simply walk that buffer 40
+// bytes per line. Plane 0 at those same offsets is *this* processor's
+// own RAM (the monitor, this program, the tag list), so it is never
+// touched: the palette below gives every odd slot the color of the
+// even slot under it, which makes plane 0's bit invisible instead.
+//
+// This is the second address scheme this file has used. The first
+// version pointed the tags at RT-11's own console text screen, plane
+// offset 0100000 (found by decoding the live default tag list at boot,
+// and confirmed by 3 real UKNC games that run under RT-11 --
+// nzeemin/uknc-highwayencounter, uknc-loderunner, uknc-desolate -- all
+// drawing there), which both processors can only reach through their
+// window-register ports (CPU: 0176640/0176642, PPU: 0177010/0177012 --
+// plane offsets >= 0100000 are outside both direct address ranges,
+// confirmed against ukncbtl-qt/emulator/emubase/Memory.cpp's
+// TranslateAddress logic), two I/O accesses per word. The CPU's own
+// RAM being planes 1/2 below 0157777 made the buffer approach possible
+// (Digger did it first; bolder and soft_scroll_test on GitHub did it
+// years earlier); its one cost is the palette trick above, since the
+// buffer's plane-0 counterpart can't be zeroed the way 0100000's could.
+// A side benefit: RT-11's console memory is never written at all now,
+// so its text screen is exactly as it was when this program exits.
 
 #include "ppu_server.h"
 #include "pdp11_irq.h"
@@ -104,7 +110,10 @@
 #define LINE_STRIDE_BYTES 40 /* 320px / 8px-per-byte, per plane, per line */
 #define INVISIBLE_LINES 19   /* yy=0..18 are never drawn to the screen */
 #define VISIBLE_LINES 288    /* yy=19..306 */
-#define SCREEN_BASE 0100000  /* plane offset -- see file header comment */
+
+// Sent to the CPU once the console is RT-11's again -- see ppu_main().
+// Must match gfour.c's own definition.
+#define PPU_MSG_BYE 0377
 
 // Fixed, compile-time base for the real tag list (tag 0 at TAG_BASE
 // above just redirects here -- see file header comment): a literal
@@ -136,45 +145,16 @@ static unsigned short peek(unsigned int addr) {
   return *(volatile unsigned short *)addr;
 }
 
-// Plane-0 access via this side's own address/data window ports
-// (0177010/0177012) -- the only way to reach SCREEN_BASE and beyond
-// from the PPU, per the file header comment. 0177012 is a byte
-// register (unlike the CPU-side planes-1/2 port, which is a word
-// register combining both planes) -- confirmed against this
-// project's own earlier port research.
-static void poke0_screen(unsigned int addr, unsigned char value) {
-  *(volatile unsigned short *)0177010 = (unsigned short)addr;
-  *(volatile unsigned char *)0177012 = value;
-}
-
-// Zeroes plane 0 behind the whole screen (SCREEN_BASE..+one frame's
-// worth of bytes) -- safe here (see file header comment), unlike the
-// CPU-framebuffer-derived range an earlier version of this file
-// zeroed. Byte by byte: 0177012 is a byte register, and there's no
-// reason to assume word alignment for what's really just a byte
-// offset. Called once by build_tags() to start from a blank screen,
-// and again by ppu_main() right before this program hands the console
-// back (see restore_tag0()'s own comment) so whatever this program
-// last drew there doesn't linger once RT-11's own tag chain is back
-// in charge of displaying it.
-static void clear_screen(void) {
-  unsigned int i;
-
-  for (i = 0; i < (unsigned int)LINE_STRIDE_BYTES * VISIBLE_LINES; i++) {
-    poke0_screen(SCREEN_BASE + i, 0);
-  }
-}
-
 // tag 0's original contents, saved by build_tags() before it
 // overwrites them -- see restore_tag0()'s own comment for why putting
 // them back matters.
 static unsigned short saved_tag0_ab, saved_tag0_tagb;
 
 // Builds the full 307-tag list (tag 0 at the fixed hardware address,
-// the other 306 starting at TAG_LIST_BASE), zeroing plane 0 behind
-// the screen along the way, then loops it forever (the last
-// visible-line tag points back to TAG_BASE).
-static void build_tags(void) {
+// the other 306 starting at TAG_LIST_BASE), the visible ones walking
+// the CPU's screen buffer from plane offset screen_base, then loops it
+// forever (the last visible-line tag points back to TAG_BASE).
+static void build_tags(unsigned int screen_base) {
   unsigned int pos, next, addr_bits, i;
 
   pos = TAG_LIST_BASE;
@@ -203,15 +183,17 @@ static void build_tags(void) {
   poke(pos + 6, next | 2 | 4); /* next tag is 4-word, type=palette */
   pos = next;
 
-  // Tag 2 (yy=2, 4-word palette): this program only ever writes
-  // slots 0, 2, 4, 6 -- plane 0 behind the screen is zeroed below, so
-  // those are genuinely the only 4 reachable slots. Nibble values are
-  // this hardware's YRGB encoding (confirmed against ukncbtl-qt's own
-  // color table, group 0 = pbpgpr's "full brightness" row): 0=black,
-  // 0xA=bright green, 0xC=bright red, 0xF=white.
+  // Tag 2 (yy=2, 4-word palette): a slot is indexed by plane0 |
+  // plane1<<1 | plane2<<2. gfour.c only ever draws planes 1/2 (slots
+  // 0/2/4/6); plane 0 under its buffer is this processor's own RAM,
+  // not something to zero (see file header comment), so each odd slot
+  // gets the even slot's color and plane 0's bit changes nothing.
+  // Nibble values are this hardware's YRGB encoding (confirmed against
+  // ukncbtl-qt's own color table, group 0 = pbpgpr's "full brightness"
+  // row): 0=black, 0xA=bright green, 0xC=bright red, 0xF=white.
   next = ALIGN4(pos + 8);
-  poke(pos, 0x0A00);     /* w1: slot0=black, slot2=green */
-  poke(pos + 2, 0x0F0C); /* w2: slot4=red, slot6=white */
+  poke(pos, 0xAA00);     /* w1: slots 0/1=black, slots 2/3=green */
+  poke(pos + 2, 0xFFCC); /* w2: slots 4/5=red, slots 6/7=white */
   poke(pos + 4, 0);      /* addressBits, unused (invisible) */
   poke(pos + 6, next);   /* next tag is 2-word (bit1=0) */
   pos = next;
@@ -225,11 +207,9 @@ static void build_tags(void) {
     pos = next;
   }
 
-  clear_screen();
-
-  // Visible lines (yy=19..306): addressBits walks RT-11's own screen
-  // memory, one scanline at a time, starting fresh at SCREEN_BASE.
-  addr_bits = SCREEN_BASE;
+  // Visible lines (yy=19..306): addressBits walks the CPU's screen
+  // buffer, one scanline at a time, from screen_base.
+  addr_bits = screen_base;
   for (i = 0; i < VISIBLE_LINES; i++) {
     int last = (i == VISIBLE_LINES - 1);
 
@@ -250,9 +230,9 @@ static void build_tags(void) {
 // that allocated range in the first place -- see its own comment -- so
 // freeing never touches it, and TAG_BASE itself would otherwise be
 // left pointing there forever). Called from ppu_main() right before it
-// returns, alongside clear_screen() (so the console comes back to a
-// blank screen instead of this program's last-drawn squares) and
-// kbd_shutdown().
+// returns, alongside kbd_shutdown(). RT-11's own screen memory was
+// never written, so what comes back is the console exactly as the
+// user left it.
 static void restore_tag0(void) {
   poke(TAG_BASE, saved_tag0_ab);
   poke(TAG_BASE + 2, saved_tag0_tagb);
@@ -330,8 +310,25 @@ static void kbd_shutdown(void) {
   pdp11_irq_vector_set(0300, saved_kbd_vec);
 }
 
+// gfour.c's one message: its screen buffer's plane offset. Set from
+// ppus_recv_init()'s interrupt-context callback, read by ppu_main()
+// outside it; 0 is never a valid offset (that would be CPU address 0,
+// the interrupt vectors), so it doubles as "not arrived yet".
+static volatile unsigned int screen_base_msg;
+
+static void on_receive(const void *buf, unsigned int size) {
+  if (size >= 2) {
+    screen_base_msg = *(const unsigned short *)buf;
+  }
+}
+
 void ppu_main(void) {
-  build_tags();
+  unsigned char bye = PPU_MSG_BYE;
+
+  ppus_recv_init(on_receive);
+  while (screen_base_msg == 0) {
+  }
+  build_tags(screen_base_msg);
   kbd_init();
 
   // Stays resident until an actual key press (not a release) comes
@@ -360,7 +357,16 @@ void ppu_main(void) {
     }
   }
 
-  clear_screen();
-  restore_tag0();
+  // Reverse of the startup, then the bye -- which must come *after*
+  // ppus_recv_shutdown(): gfour.c's .EXIT follows the bye almost at
+  // once, RT-11 talks to the resident monitor over the same channel 2,
+  // and a request landing while this program's receiver was still
+  // armed would be swallowed by on_receive() -- RMON would then wait
+  // for an answer forever. ppus_recv_shutdown() also puts the channel's
+  // RX interrupt enable back the way the monitor had it (see its own
+  // comment in libppu) -- it is how that request reaches the monitor.
   kbd_shutdown();
+  restore_tag0();
+  ppus_recv_shutdown();
+  ppus_send(&bye, 1);
 }
