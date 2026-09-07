@@ -44,6 +44,12 @@ static ppus_receive_fn ppus_recv_callback;
 static unsigned short ppus_recv_saved_vec_pc;
 static unsigned short ppus_recv_saved_vec_psw;
 
+// 0177066 as ppus_recv_init() found it -- specifically whether channel
+// 2's RX-interrupt-enable bit was already set. It was: the resident
+// monitor keeps that interrupt on, it's how RT-11's own requests to
+// the PPU reach it. See ppus_recv_shutdown() for why this matters.
+static unsigned char ppus_recv_saved_rx_enable;
+
 static unsigned char ppus_recv_buf[PPUS_RECV_MAX];
 static unsigned int ppus_recv_want;   // total payload length the sender announced
 static unsigned int ppus_recv_got;    // payload bytes received so far
@@ -184,7 +190,9 @@ asm(
 // console output the moment this ran, by clearing channel 0's
 // already-set enable bit along with setting channel 2's). BISB reads
 // the register first, so channel 0 and 1's current bits survive
-// untouched -- only channel 2's bit actually changes.
+// untouched -- only channel 2's bit actually changes. The register's
+// prior value is saved first, because channel 2's own bit is normally
+// *already set* by the resident monitor -- see ppus_recv_shutdown().
 //
 // Call this once from ppu_main(), before doing anything that would
 // race with a command arriving -- there is no other setup a program
@@ -257,6 +265,7 @@ void ppus_recv_init(ppus_receive_fn callback) {
       "mtps $0340\n\t"
       "mov @$0340, %0\n\t"
       "mov @$0342, %1\n\t"
+      "movb @$0177066, %2\n\t"
       "mov $ppus_recv_isr, @$0340\n\t"
       "mov $0200, @$0342\n\t"
       "movb @$0177064, r0\n\t"
@@ -266,16 +275,26 @@ void ppus_recv_init(ppus_receive_fn callback) {
       "bitb $020, @$0177076\n\t"
       "beq 1b\n\t"
       "movb $1, @$0177072\n\t"
-      : "=r"(ppus_recv_saved_vec_pc), "=r"(ppus_recv_saved_vec_psw)
+      : "=r"(ppus_recv_saved_vec_pc), "=r"(ppus_recv_saved_vec_psw),
+        "=r"(ppus_recv_saved_rx_enable)
       :
       : "r0", "cc", "memory");
 }
 
 // Puts vector 0340/0342 back to what ppus_recv_init() found there
-// (the PPU-resident monitor's own handler) and disables channel 2's
-// RX interrupt again (undoing ppus_recv_init()'s own bisb -- BIC only
-// touches bit 2, leaving channels 0/1's enable bits exactly as they
-// are, same reasoning as that bisb's own comment). Must be called
+// (the PPU-resident monitor's own handler) and puts channel 2's
+// RX-interrupt-enable bit back to what it was too (BIC/BISB only touch
+// bit 2, leaving channels 0/1's enable bits exactly as they are, same
+// reasoning as ppus_recv_init()'s own bisb comment). "Back to what it
+// was" and not simply "off": the resident monitor runs with that
+// interrupt *enabled* -- it is the path RT-11's requests to the PPU
+// (the KMON reload behind every .EXIT, disk I/O) come in on. An
+// earlier version of this just cleared the bit, and once the program
+// returned to the monitor, the monitor sat in its idle loop deaf while
+// RMON polled channel 2's READY bit (176674) forever: the CPU never
+// got back to the KMON prompt. Confirmed with the ppupong example
+// itself (prints "back from PPU", then hangs in RMON at 157316-157320)
+// and fixed by restoring the bit. Must be called
 // before returning from ppu_main() -- i.e. before ppus_start.c's shim
 // runs ppus_exit() -- because ppus_exit() frees this program's own
 // PPU memory block, and vector 0340 would otherwise be left pointing
@@ -288,13 +307,17 @@ void ppus_recv_init(ppus_receive_fn callback) {
 // ***") shortly after a well-behaved ppuc_send()/ppuc_recv() exchange
 // completes and the CPU side reaches its own .EXIT.
 void ppus_recv_shutdown(void) {
+  unsigned char rx_enable_was = ppus_recv_saved_rx_enable & 4;
+
   asm volatile(
       "mtps $0340\n\t"
       "bic $4, @$0177066\n\t"
+      "bisb %2, @$0177066\n\t"
       "mov %0, @$0340\n\t"
       "mov %1, @$0342\n\t"
       "mtps $0\n\t" ::
           "r"(ppus_recv_saved_vec_pc),
-          "r"(ppus_recv_saved_vec_psw)
+          "r"(ppus_recv_saved_vec_psw),
+          "r"(rx_enable_was)
       : "cc", "memory");
 }
