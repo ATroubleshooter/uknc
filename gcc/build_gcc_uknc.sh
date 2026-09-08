@@ -29,6 +29,10 @@ patch -p1 < ${BUILDDIR}/binutils_2.patch
 patch -p1 < ${BUILDDIR}/binutils_3.patch
 patch -p1 < ${BUILDDIR}/binutils_4.patch
 patch -p1 < ${BUILDDIR}/binutils_5.patch
+# Local, not yet in the fork above: the REL emitter's p-sect relocation
+# constants must be p-sect-relative (a .data reference was relocated by
+# .data's offset twice -- see the patch's own comment).
+patch -p1 < ${BUILDDIR}/patches/binutils_6_pdp11rt11rel_psect_constant.patch
 rm ${BUILDDIR}/binutils_1.patch
 rm ${BUILDDIR}/binutils_2.patch
 rm ${BUILDDIR}/binutils_3.patch

@@ -128,6 +128,17 @@ long ppuc_load_file(const char *name, unsigned int size);
 //           the load
 long ppuc_load_code(const char *name);
 
+// The same, but at a PPU address of the caller's choosing instead of a
+// block from ppuc_alloc(). The monitor's allocator hands out blocks
+// top-down from about 026450, right above its own workspace (a
+// 1348-byte module landed at 023666, 2026-09-08), while 030000..057777
+// sits empty under RT-11: a program that has outgrown the small
+// allocations the examples make can load itself there instead, with
+// nothing of the monitor's within reach. The caller owns that memory
+// -- nothing is allocated or freed, and ppuc_free() must not be called
+// on the result. `at` must be even.
+long ppuc_load_code_at(const char *name, unsigned short at);
+
 // Sends buf (size bytes) to a PPU program that is already running (via
 // ppuc_run()) and has armed itself to receive with ppus_recv_init()
 // (see ppu_server.h) -- a different channel usage than every function

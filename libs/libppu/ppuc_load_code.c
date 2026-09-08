@@ -465,7 +465,10 @@ static int zero_fill_ppu(unsigned short ppu_addr, unsigned int size) {
   return 1;
 }
 
-long ppuc_load_code(const char *name) {
+// The loader proper: with fixed == 0 the module goes into a block
+// ppuc_alloc() hands out; with fixed != 0 it goes to `at`, an address
+// the caller vouches for (see ppuc_load_code_at()).
+static long load_code(const char *name, unsigned short at, int fixed) {
   int fd;
   struct stat st;
   unsigned char *buf;
@@ -527,19 +530,25 @@ long ppuc_load_code(const char *name) {
     return -1;
   }
 
-  alloc_result = ppuc_alloc(content_size);
-  if (alloc_result < 0) {
-    free(buf);
-    return -1;  // errno already set by ppuc_alloc
+  if (fixed) {
+    ppu_addr = at;
+  } else {
+    alloc_result = ppuc_alloc(content_size);
+    if (alloc_result < 0) {
+      free(buf);
+      return -1;  // errno already set by ppuc_alloc
+    }
+    ppu_addr = (unsigned short)alloc_result;
   }
-  ppu_addr = (unsigned short)alloc_result;
   psect_base[PSECT_TEXT] = ppu_addr + psect_off[PSECT_TEXT];
   psect_base[PSECT_DATA] = ppu_addr + psect_off[PSECT_DATA];
   psect_base[PSECT_BSS] = ppu_addr + psect_off[PSECT_BSS];
   psect_base[PSECT_ABS] = 0;
 
   if (!zero_fill_ppu(ppu_addr, content_size)) {
-    ppuc_free(ppu_addr);
+    if (!fixed) {
+      ppuc_free(ppu_addr);
+    }
     free(buf);
     errno = EIO;
     return -1;
@@ -551,11 +560,25 @@ long ppuc_load_code(const char *name) {
   // EIO) on any failure.
   if (!parse_txt_rld(buf, size, &pos, psect_size, psect_off, psect_base,
                       content_size)) {
-    ppuc_free(ppu_addr);
+    if (!fixed) {
+      ppuc_free(ppu_addr);
+    }
     free(buf);
     return -1;
   }
 
   free(buf);
   return ppu_addr;
+}
+
+long ppuc_load_code(const char *name) {
+  return load_code(name, 0, 0);
+}
+
+long ppuc_load_code_at(const char *name, unsigned short at) {
+  if ((at & 1) != 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  return load_code(name, at, 1);
 }
