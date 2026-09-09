@@ -29,6 +29,10 @@ patch -p1 < ${BUILDDIR}/binutils_2.patch
 patch -p1 < ${BUILDDIR}/binutils_3.patch
 patch -p1 < ${BUILDDIR}/binutils_4.patch
 patch -p1 < ${BUILDDIR}/binutils_5.patch
+# Local, not yet in the fork above: the REL emitter's p-sect relocation
+# constants must be p-sect-relative (a .data reference was relocated by
+# .data's offset twice -- see the patch's own comment).
+patch -p1 < ${BUILDDIR}/patches/binutils_6_pdp11rt11rel_psect_constant.patch
 rm ${BUILDDIR}/binutils_1.patch
 rm ${BUILDDIR}/binutils_2.patch
 rm ${BUILDDIR}/binutils_3.patch
@@ -110,6 +114,7 @@ curl https://github.com/wdigger/sourceware-mirror-newlib-cygwin/commit/8ec5d302b
 curl https://github.com/wdigger/sourceware-mirror-newlib-cygwin/commit/930a14e6d52128ddfb92f1d7a87d76b6a4f77bfe.patch -o newlib_4.patch
 curl https://github.com/wdigger/sourceware-mirror-newlib-cygwin/commit/d555cd2dc7d36f9f3381e8491565d306efa585f6.patch -o newlib_5.patch
 curl https://github.com/wdigger/sourceware-mirror-newlib-cygwin/commit/d01a026f73060db90afc9af2ea986549da41a715.patch -o newlib_6.patch
+curl https://github.com/wdigger/sourceware-mirror-newlib-cygwin/commit/a3d569699dc78dfd3974af1560b80d71cc1c505e.patch -o newlib_7.patch
 
 cd ${BUILDDIR}/src/gcc-${GCC_VERSION}
 patch -p1 < ${BUILDDIR}/newlib_1.patch
@@ -118,12 +123,14 @@ patch -p1 < ${BUILDDIR}/newlib_3.patch
 patch -p1 < ${BUILDDIR}/newlib_4.patch
 patch -p1 < ${BUILDDIR}/newlib_5.patch
 patch -p1 < ${BUILDDIR}/newlib_6.patch
+patch -p1 < ${BUILDDIR}/newlib_7.patch
 rm ${BUILDDIR}/newlib_1.patch
 rm ${BUILDDIR}/newlib_2.patch
 rm ${BUILDDIR}/newlib_3.patch
 rm ${BUILDDIR}/newlib_4.patch
 rm ${BUILDDIR}/newlib_5.patch
 rm ${BUILDDIR}/newlib_6.patch
+rm ${BUILDDIR}/newlib_7.patch
 
 # newlib_1.patch touches configure.host/libc/acinclude.m4, newlib_4.patch
 # touches libc/sys/rt11/Makefile.inc, and newlib_5.patch touches
