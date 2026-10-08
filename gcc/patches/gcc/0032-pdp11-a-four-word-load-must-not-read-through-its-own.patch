@@ -1,0 +1,146 @@
+From: Yury Klushin <digger@live.ru>
+Date: Thu, 8 Oct 2026 23:22:43 +0300
+Subject: [PATCH] pdp11: a four-word load must not read through the register it
+ filled
+
+output_move_multiple issued the words of a multi-word move in order.
+When the destination is a register group and the source is memory
+addressed through one of those registers, the word that lands in the
+base register overwrites the address the remaining words are still
+being fetched through:
+
+  mov  (r2),r0          mov  (r2),r0
+  mov  02(r2),r1   ->   mov  02(r2),r1
+  mov  04(r2),r2        mov  06(r2),r3
+  mov  06(r2),r3        mov  04(r2),r2
+
+pdp11_expand_operands already copes with two words by choosing which
+end to start from, and for two words that is enough: the base is
+either the first word or the last.  With four it can be in the middle,
+where no order works, so the word that clobbers the base is held back
+and emitted last instead.
+
+Only an address without side effects may be permuted: with an
+auto-increment source all four words share one rtx and the order is
+what advances the pointer.  Such an address cannot overlap a register
+destination anyway, since that would be two assignments to the base in
+one insn.  And pdp11_legitimate_address_p refuses (MEM (MEM ...)) for
+modes wider than a word, so at most one word can match.
+
+Reachable because *movdi_nocc's memory alternative has no earlyclobber
+on the destination: seen with -mlra, where the allocator picks r0-r3
+for the value and r2 for the address.
+
+From prcoder-1/digger-bk0010's GCC patch for the BK-0010.  The test is
+this tree's and runs on the machine: it loads a known 64-bit constant
+through a base register forced into the middle of the group and checks
+the value that comes back.
+---
+ gcc/config/pdp11/pdp11.cc                     | 37 ++++++++++++++++--
+ .../gcc.target/pdp11/movdi-overlap.c          | 38 +++++++++++++++++++
+ 2 files changed, 72 insertions(+), 3 deletions(-)
+ create mode 100644 gcc/testsuite/gcc.target/pdp11/movdi-overlap.c
+
+diff --git a/gcc/config/pdp11/pdp11.cc b/gcc/config/pdp11/pdp11.cc
+index 488731b..2cd02fd 100644
+--- a/gcc/config/pdp11/pdp11.cc
++++ b/gcc/config/pdp11/pdp11.cc
+@@ -688,7 +688,7 @@ output_move_multiple (rtx *operands)
+   rtx adjops[2];
+ 
+   pdp11_action action[2];
+-  int i, words;
++  int i, words, last;
+ 
+   words = GET_MODE_BITSIZE (GET_MODE (operands[0])) / 16;
+   adjops[1] = gen_rtx_CONST_INT (HImode, words * 2);
+@@ -710,9 +710,40 @@ output_move_multiple (rtx *operands)
+       output_asm_insn ("sub\t%1,%0", adjops);
+     }
+ 
+-  /* Do the words.  */
++  /* Do the words.  If the destination is a register group and the
++     source is memory addressed through one of those registers, the
++     word that lands in the base register has to go last -- otherwise
++     the words after it are fetched through a register already
++     overwritten.  pdp11_expand_operands handles the two-word case by
++     choosing which end to start from, but for four words the base can
++     sit in the middle of the group, where no order works and the
++     emission itself has to be permuted.
++
++     Only an address without side effects may be permuted: with an
++     auto-increment source every word shares one rtx and the order is
++     what advances the pointer.  Such an address cannot overlap a
++     register destination anyway -- that would be a second assignment
++     to the base in one insn, which auto-inc-dec.cc does not create.
++
++     pdp11_legitimate_address_p refuses (MEM (MEM ...)) for modes wider
++     than a word, so the address holds at most one register and at most
++     one word can match.  */
++  last = -1;
++  if (REG_P (operands[0]) && MEM_P (operands[1])
++      && !side_effects_p (XEXP (operands[1], 0)))
++    for (i = 0; i < words; i++)
++      if (REG_P (exops[i][0]) && MEM_P (exops[i][1])
++	  && reg_overlap_mentioned_p (exops[i][0], XEXP (exops[i][1], 0)))
++	{
++	  last = i;
++	  break;
++	}
++
+   for (i = 0; i < words; i++)
+-    output_asm_insn (singlemove_string (exops[i]), exops[i]);
++    if (i != last)
++      output_asm_insn (singlemove_string (exops[i]), exops[i]);
++  if (last >= 0)
++    output_asm_insn (singlemove_string (exops[last]), exops[last]);
+ 
+   /* Check for increment after.  */
+   if (action[0] == inc_after)
+diff --git a/gcc/testsuite/gcc.target/pdp11/movdi-overlap.c b/gcc/testsuite/gcc.target/pdp11/movdi-overlap.c
+new file mode 100644
+index 0000000..fc53f36
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/pdp11/movdi-overlap.c
+@@ -0,0 +1,38 @@
++/* { dg-do run { target pdp11-*-* } } */
++/* { dg-options "-O2 -mlra" } */
++
++/* A four-word load into a register group whose address register sits
++   inside that group.  The word that lands in the base register has to
++   be fetched last: with the words in order, the third one overwrites
++   r2 and the fourth is then read through it.
++
++   pdp11_expand_operands copes with the two-word case by choosing which
++   end to start from; for four words the base can be in the middle,
++   where no order works and output_move_multiple has to permute.  */
++
++static long long mem = 0x0123456789abcdefLL;
++
++/* Volatile, so the address has to be loaded at run time: given the
++   symbol outright the compiler addresses it absolutely and the base
++   register never appears.  */
++static long long *volatile where = &mem;
++
++long long __attribute__((noinline))
++load (void)
++{
++  register long long *p asm ("r2");
++  register long long v asm ("r0");
++
++  /* Through an asm, so the address really is in r2 and nothing may
++     re-materialise it somewhere more convenient.  */
++  asm volatile ("mov\t%1,%0" : "=r" (p) : "r" (where));
++  v = *p;
++  asm volatile ("" : : "r" (v));
++  return v;
++}
++
++int
++main (void)
++{
++  return load () != 0x0123456789abcdefLL;
++}
+-- 
+2.54.0 (Apple Git-157)
+
