@@ -1,0 +1,139 @@
+From: Yury Klushin <digger@live.ru>
+Date: Thu, 8 Oct 2026 23:04:07 +0300
+Subject: [PATCH] pdp11: a volatile bit-field is as wide as it was declared
+
+This machine is programmed through its registers, and a register is
+reached as a volatile bit-field more often than as anything else.  The
+compiler was splitting those accesses into bytes:
+
+  movb (r1),r0 ; bicb $-020,r0 ; bisb $0120,r0 ; movb r0,(r1)
+
+Half the registers here do not take that.  Some latch on the write of
+a whole word, some refuse a byte access outright, and a read-write of
+one byte of a word-wide register is not what the hardware was asked
+for in the first place.  It now comes out as the word it was declared
+as:
+
+  mov (r1),r0 ; bic $0360,r0 ; bis $0120,r0 ; mov r0,(r1)
+
+Two things are needed together, which is why neither alone had any
+effect.  -fstrict-volatile-bitfields tells the middle-end to keep the
+access at the declared width, and is now the default here
+(-fno-strict-volatile-bitfields still gets the other behaviour).  But
+expmed.cc only honours that while the memory is aligned for the mode,
+and without PCC_BITFIELD_TYPE_MATTERS a "volatile unsigned : 4" sits
+in a byte-aligned container -- so the access narrowed to a byte
+anyway, flag or no flag.
+
+PCC_BITFIELD_TYPE_MATTERS changes structure layout, which is an ABI
+question, but barely one on a machine whose int is 16 bits: a field
+only moves when it would straddle a 16-bit unit, and a struct that
+pads for that was already being rounded up to its alignment.  A char
+followed by a one-bit field is two bytes either way; a char followed
+by a twelve-bit field is four, as it was.
+
+The cost is on the other side: a non-volatile bit-field in one byte is
+now a word read-modify-write too, four bytes of code more than the
+byte form.  The upstream patch this came from avoids that with an
+insvhi expander that fails for exactly that case; it is not taken
+here, because the rest of that expander is written for a machine
+without EIS and this one has it.
+
+The idea is from prcoder-1/digger-bk0010's GCC patch for the BK-0010,
+which needs the same thing for the same reason.
+
+Checked in gcc.target/pdp11/volatile-bitfield.c: the write of a
+volatile field is mov/bic/bis/mov with no byte access anywhere in it.
+The examples here build byte for byte as before.
+---
+ gcc/config/pdp11/pdp11.cc                     | 11 +++++++
+ gcc/config/pdp11/pdp11.h                      | 10 ++++++
+ .../gcc.target/pdp11/volatile-bitfield.c      | 33 +++++++++++++++++++
+ 3 files changed, 54 insertions(+)
+ create mode 100644 gcc/testsuite/gcc.target/pdp11/volatile-bitfield.c
+
+diff --git a/gcc/config/pdp11/pdp11.cc b/gcc/config/pdp11/pdp11.cc
+index 41265dd..017f601 100644
+--- a/gcc/config/pdp11/pdp11.cc
++++ b/gcc/config/pdp11/pdp11.cc
+@@ -2472,6 +2472,17 @@ pdp11_option_override (void)
+ 	       "are alternative PDP-11 floating point options, not a pair");
+       target_flags &= ~MASK_FIS;
+     }
++
++  /* This machine is programmed through its registers, and a register
++     is reached as a volatile bit-field more often than as anything
++     else.  Some of them latch on the write of a whole word, some
++     refuse a byte access outright, and none of them want the two byte
++     stores the middle-end is otherwise free to split a word write
++     into.  So keep a volatile bit-field access at the width it was
++     declared with, which is what -fstrict-volatile-bitfields asks for;
++     -fno-strict-volatile-bitfields still gets the other behaviour.  */
++  if (flag_strict_volatile_bitfields < 0)
++    flag_strict_volatile_bitfields = 1;
+ }
+ 
+ static void
+diff --git a/gcc/config/pdp11/pdp11.h b/gcc/config/pdp11/pdp11.h
+index 73141d2..1cec135 100644
+--- a/gcc/config/pdp11/pdp11.h
++++ b/gcc/config/pdp11/pdp11.h
+@@ -142,6 +142,16 @@ extern const struct real_format pdp11_d_format;
+    when given unaligned data.  */
+ #define STRICT_ALIGNMENT 1
+ 
++/* A named bit-field aligns its structure to the field's declared type,
++   not to whatever container the bits happen to fit in.  This is the PCC
++   convention, and here it is what makes a volatile bit-field reach the
++   hardware as the width it was declared with: expmed.cc keeps a strict
++   volatile access at the declared mode only while the memory is aligned
++   for that mode, and without this a "volatile unsigned : 4" sits in a
++   byte-aligned container, so the access narrows to a byte.  Half this
++   machine's registers do not take a byte write.  */
++#define PCC_BITFIELD_TYPE_MATTERS true
++
+ /* "HW_DIVIDE" actually means 64 by 32 bit divide.  While some PDP11
+    models have hardware divide, it is for 32 by 16 bits only, so we
+    call this platform "no hardware divide".  */
+diff --git a/gcc/testsuite/gcc.target/pdp11/volatile-bitfield.c b/gcc/testsuite/gcc.target/pdp11/volatile-bitfield.c
+new file mode 100644
+index 0000000..7242c77
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/pdp11/volatile-bitfield.c
+@@ -0,0 +1,33 @@
++/* { dg-do compile { target pdp11-*-* } } */
++/* { dg-options "-O2" } */
++
++/* A device register is reached as a volatile bit-field more often than
++   as anything else, and half of this machine's registers do not take a
++   byte write: some latch on the write of a whole word, some refuse a
++   byte access outright.  So an access to a volatile bit-field has to
++   stay the width it was declared with -- a word here -- rather than be
++   narrowed to the byte the bits happen to sit in.
++
++   Two things together make that hold: PCC_BITFIELD_TYPE_MATTERS, so
++   the field's container is aligned as the declared type, and
++   -fstrict-volatile-bitfields on by default, so the middle-end keeps
++   the access at that width.  */
++
++struct reg
++{
++  volatile unsigned low : 4, high : 4, rest : 8;
++};
++
++void
++set_field (struct reg *r)
++{
++  r->high = 5;
++}
++
++/* Read-modify-write of the whole word, and not a byte in sight.  */
++/* { dg-final { scan-assembler "mov\t" } } */
++/* { dg-final { scan-assembler "bic\t" } } */
++/* { dg-final { scan-assembler "bis\t" } } */
++/* { dg-final { scan-assembler-not "movb\t" } } */
++/* { dg-final { scan-assembler-not "bicb\t" } } */
++/* { dg-final { scan-assembler-not "bisb\t" } } */
+-- 
+2.54.0 (Apple Git-157)
+
