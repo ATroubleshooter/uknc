@@ -1,0 +1,204 @@
+From: Yury Klushin <digger@live.ru>
+Date: Thu, 8 Oct 2026 22:55:34 +0300
+Subject: [PATCH] pdp11: test a bit with BIT
+
+BIT computes src & dst for the condition codes and writes nothing
+back, which is exactly what a bit test wants.  Without a pattern for
+it the test went through AND -- and this machine's only AND is BIC,
+which clears the bits of a mask rather than keeping them.  So the mask
+had to be complemented, the result had to go somewhere, and a question
+that needs no register and no result cost both:
+
+  mov  02(sp),r0        bit  02(sp),$0100
+  bic  $-0101,r0   ->   bne  L_7
+  bne  L_7
+
+Two patterns, because a bit test arrives in two shapes.  A mask of
+several bits or one held in a variable stays an AND, and *bit<mode>
+takes it.  A mask of exactly one bit does not: combine canonicalises
+"x & (1 << N)" into a zero_extract, so *cbranch_bit1<mode> matches that
+and works the mask back out -- BITS_BIG_ENDIAN is 0 here, so it is
+1 << pos.  Leaving that second one out would have meant missing the
+commonest form of all, a flag bit in a device register.
+
+BIT sets N and Z from the result and clears V, leaving C alone, which
+is what CCNZ means -- hence the CCNZ mode on the compare rather than
+CC.
+
+The idea is from prcoder-1/digger-bk0010's own GCC patch for the
+BK-0010, which carries the *bit<mode> pattern; the single-bit one and
+the test are this tree's.
+
+Checked on the four shapes in gcc.target/pdp11/bit-test.c: four BIT
+instructions and no BIC between them.  The examples here build byte
+for byte as before -- none of them tests a bit this way -- and the
+rest of the pdp11 tests still pass.
+---
+ gcc/config/pdp11/pdp11.md                 | 92 +++++++++++++++++++++++
+ gcc/testsuite/gcc.target/pdp11/bit-test.c | 44 +++++++++++
+ 2 files changed, 136 insertions(+)
+ create mode 100644 gcc/testsuite/gcc.target/pdp11/bit-test.c
+
+diff --git a/gcc/config/pdp11/pdp11.md b/gcc/config/pdp11/pdp11.md
+index 8e20b1e..97c6e37 100644
+--- a/gcc/config/pdp11/pdp11.md
++++ b/gcc/config/pdp11/pdp11.md
+@@ -263,6 +263,24 @@
+    cmp<PDPint:isfx>\t%0,%1"
+   [(set_attr "length" "2,2,4,4,4,6")])
+ 
++;; BIT computes src & dst for the condition codes alone, writing
++;; nothing back.  Without this pattern a bit test goes through AND,
++;; which this machine spells BIC -- so the mask has to be complemented
++;; and the result stored somewhere, costing an instruction and a
++;; register for a question that needs neither.
++;;
++;; N and Z come from the result and V is cleared, which is what CCNZ
++;; means; C is left alone, which is why this cannot be a CC-mode insn.
++(define_insn "*bit<mode>"
++  [(set (reg:CCNZ CC_REGNUM)
++	(compare:CCNZ (and:PDPint
++		         (match_operand:PDPint 0 "general_operand" "rR,rR,Q,Qi")
++		         (match_operand:PDPint 1 "general_operand" "rR,Qi,rR,Qi"))
++		      (const_int 0)))]
++  ""
++  "bit<PDPint:isfx>\t%0,%1"
++  [(set_attr "length" "2,4,4,6")])
++
+ ;; Two word compare
+ (define_insn "cmpsi"
+   [(set (reg:CC CC_REGNUM)
+@@ -493,6 +511,80 @@
+ 		      (pc)))]
+   "")
+ 
++;; A branch on (X & Y) against zero, which is what combine makes of
++;; "if (x & MASK)".  Split to BIT plus the branch rather than letting
++;; it reach the generic path, where the AND would be materialised
++;; first.
++(define_insn_and_split "*cbranch_bit<mode>"
++  [(set (pc)
++	(if_then_else (match_operator 0 "ccnz_operator"
++		       [(and:PDPint
++			   (match_operand:PDPint 1 "general_operand" "g")
++			   (match_operand:PDPint 2 "general_operand" "g"))
++			(const_int 0)])
++		      (label_ref (match_operand 3 "" ""))
++		      (pc)))]
++  ""
++  "#"
++  "reload_completed"
++  [(set (reg:CCNZ CC_REGNUM)
++	(compare:CCNZ (and:PDPint (match_dup 1) (match_dup 2))
++		      (const_int 0)))
++   (set (pc)
++	(if_then_else (match_op_dup 0
++		       [(reg:CCNZ CC_REGNUM) (const_int 0)])
++		      (label_ref (match_dup 3))
++		      (pc)))]
++  "")
++
++;; The same test written as one bit.  Combine canonicalises
++;; "if (x & (1 << N))" into a zero_extract rather than an AND, so
++;; without this the commonest form of all -- a flag bit in a device
++;; register -- would be the one case still going through BIC.
++;; BITS_BIG_ENDIAN is 0 here, so the position counts from the low end
++;; and the mask is 1 << pos.
++(define_insn_and_split "*cbranch_bit1<mode>"
++  [(set (pc)
++	(if_then_else (match_operator 0 "ccnz_operator"
++		       [(zero_extract:PDPint
++			   (match_operand:PDPint 1 "general_operand" "g")
++			   (const_int 1)
++			   (match_operand 2 "const_int_operand" "n"))
++			(const_int 0)])
++		      (label_ref (match_operand 3 "" ""))
++		      (pc)))]
++  ""
++  "#"
++  "reload_completed"
++  [(set (reg:CCNZ CC_REGNUM)
++	(compare:CCNZ (and:PDPint (match_dup 1) (match_dup 4))
++		      (const_int 0)))
++   (set (pc)
++	(if_then_else (match_op_dup 0
++		       [(reg:CCNZ CC_REGNUM) (const_int 0)])
++		      (label_ref (match_dup 3))
++		      (pc)))]
++  "operands[4] = GEN_INT ((HOST_WIDE_INT) 1 << INTVAL (operands[2]));")
++
++(define_insn_and_split "cbranch<mode>4"
++  [(set (pc)
++	(if_then_else (match_operator 0 "ordered_comparison_operator"
++		       [(match_operand:QHSDint 1 "cmp_operand" "g")
++			(match_operand:QHSDint 2 "cmp_operand" "g")])
++		      (label_ref (match_operand 3 "" ""))
++		      (pc)))]
++  ""
++  "#"
++  "reload_completed"
++  [(set (reg:CC CC_REGNUM)
++	(compare:CC (match_dup 1) (match_dup 2)))
++   (set (pc)
++	(if_then_else (match_op_dup 0
++                      [(reg:CC CC_REGNUM) (const_int 0)])
++		      (label_ref (match_dup 3))
++		      (pc)))]
++  "")
++
+ ;; This splitter turns a branch on float condition into a branch on
+ ;; CPU condition, by adding a CFCC.
+ (define_split
+diff --git a/gcc/testsuite/gcc.target/pdp11/bit-test.c b/gcc/testsuite/gcc.target/pdp11/bit-test.c
+new file mode 100644
+index 0000000..790df95
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/pdp11/bit-test.c
+@@ -0,0 +1,44 @@
++/* { dg-do compile { target pdp11-*-* } } */
++/* { dg-options "-O2" } */
++
++/* BIT computes src & dst for the condition codes and writes nothing
++   back, so a bit test needs neither a temporary register nor the
++   complemented mask that BIC (this machine's only AND) would want.
++   All three shapes a bit test arrives in have to reach it: a mask of
++   several bits, a mask held in a variable, and -- the one that took a
++   second pattern, because combine canonicalises it into a zero_extract
++   -- a mask of exactly one bit.  */
++
++extern void f (void);
++
++void
++bits_several (unsigned x)
++{
++  if (x & 0101)
++    f ();
++}
++
++void
++bits_variable (unsigned x, unsigned m)
++{
++  if (x & m)
++    f ();
++}
++
++void
++bits_one (unsigned x)
++{
++  if (x & 0100)
++    f ();
++}
++
++/* The shape this is really for: waiting on a device register.  */
++void
++bits_poll (volatile unsigned *r)
++{
++  while (!(*r & 0400))
++    ;
++}
++
++/* { dg-final { scan-assembler-times "bit\t" 4 } } */
++/* { dg-final { scan-assembler-not "bic\t" } } */
+-- 
+2.54.0 (Apple Git-157)
+
