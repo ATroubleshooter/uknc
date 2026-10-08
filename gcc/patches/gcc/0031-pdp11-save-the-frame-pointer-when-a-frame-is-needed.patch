@@ -1,0 +1,88 @@
+From: Yury Klushin <digger@live.ru>
+Date: Thu, 8 Oct 2026 23:09:05 +0300
+Subject: [PATCH] pdp11: save the frame pointer when a frame is needed
+
+pdp11_saved_regno asked the dataflow whether a register had ever been
+live, which is the right question for a call-saved register in general
+and the wrong one for the frame pointer.  LRA can decide that a frame
+is needed after the dataflow has stopped looking -- an asm that
+clobbers the stack pointer is enough -- and nothing goes back to mark
+r5 live.  The prologue then builds its frame in r5 without saving it,
+and the epilogue returns without putting it back:
+
+  _f:   mov  sp,r5          _f:   mov  r5,-(sp)
+        add  $-010,sp             mov  sp,r5
+        ...            ->         add  $-010,sp
+        mov  r5,sp                ...
+        rts  pc                   mov  r5,sp
+                                  mov  (sp)+,r5
+                                  rts  pc
+
+r5 is call-saved here, so a caller holding anything in it simply lost
+it across the call.  Only under -mlra; the old allocator marks the
+register live in time.
+
+From prcoder-1/digger-bk0010's GCC patch for the BK-0010, where it was
+found; the test is this tree's.
+---
+ gcc/config/pdp11/pdp11.cc                     | 11 +++++++-
+ .../gcc.target/pdp11/lra-frame-pointer.c      | 25 +++++++++++++++++++
+ 2 files changed, 35 insertions(+), 1 deletion(-)
+ create mode 100644 gcc/testsuite/gcc.target/pdp11/lra-frame-pointer.c
+
+diff --git a/gcc/config/pdp11/pdp11.cc b/gcc/config/pdp11/pdp11.cc
+index 017f601..488731b 100644
+--- a/gcc/config/pdp11/pdp11.cc
++++ b/gcc/config/pdp11/pdp11.cc
+@@ -332,7 +332,16 @@ static bool pdp11_scalar_mode_supported_p (scalar_mode);
+ static inline bool
+ pdp11_saved_regno (unsigned regno)
+ {
+-  return !call_used_or_fixed_reg_p (regno) && df_regs_ever_live_p (regno);
++  /* The frame pointer has to be saved whenever a frame pointer is
++     needed, and asking the dataflow whether it was ever live is not
++     the same question: LRA can decide late that a frame is needed --
++     an asm that clobbers the stack pointer is enough -- and nothing
++     goes back to mark the register live.  The prologue then builds a
++     frame in a call-saved register it never saved, and the epilogue
++     returns without putting it back.  */
++  return !call_used_or_fixed_reg_p (regno)
++	 && (df_regs_ever_live_p (regno)
++	     || (regno == HARD_FRAME_POINTER_REGNUM && frame_pointer_needed));
+ }
+ 
+ /* Expand the function prologue.  */
+diff --git a/gcc/testsuite/gcc.target/pdp11/lra-frame-pointer.c b/gcc/testsuite/gcc.target/pdp11/lra-frame-pointer.c
+new file mode 100644
+index 0000000..5cbe334
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/pdp11/lra-frame-pointer.c
+@@ -0,0 +1,25 @@
++/* { dg-do compile { target pdp11-*-* } } */
++/* { dg-options "-O2 -mlra" } */
++
++/* An asm that clobbers the stack pointer makes a frame pointer
++   necessary, and under LRA that decision comes after the dataflow has
++   stopped looking -- so r5 was never marked live, the prologue built a
++   frame in it without saving it, and the epilogue returned without
++   putting it back.  r5 is call-saved here, so the caller simply lost
++   it.  */
++
++extern void g (int *);
++
++int
++f (int n)
++{
++  int a[4];
++
++  g (a);
++  asm volatile ("" ::: "sp");
++  return a[n & 3];
++}
++
++/* Saved on the way in and restored on the way out.  */
++/* { dg-final { scan-assembler "mov\tr5,-\\(sp\\)" } } */
++/* { dg-final { scan-assembler "mov\t\\(sp\\)\\+,r5" } } */
+-- 
+2.54.0 (Apple Git-157)
+
