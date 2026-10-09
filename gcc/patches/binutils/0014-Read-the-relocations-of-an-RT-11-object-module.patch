@@ -1,0 +1,389 @@
+From: Yury Klushin <digger@live.ru>
+Date: Fri, 10 Oct 2026 00:00:00 +0300
+Subject: [PATCH] Read the relocations of an RT-11 object module
+
+RLD entries become BFD relocations, so objdump -r has them and
+objdump -dr shows what each operand word refers to.
+
+Four howtos, named as a.out-pdp11 names its own because they mean the
+same thing: a word or a byte, plain or measured from the program
+counter.  RT-11 keeps the addend in the RLD entry rather than in the
+word being relocated -- of the internal entries in SYSLIB.OBJ, 12 of
+14 have a word in the module that is not the addend at all -- so none
+of them is partial in-place.
+
+The displacement an entry carries is measured from its TXT record's
+type word, four bytes ahead of that record's data, so the bias comes
+off to reach an offset in the section.  That was settled on the
+machine rather than from the manual: taking the displacement as it
+stands, or minus two, matches the words LINK relocated in 2 of 14
+cases each, by coincidence; minus four matches 14 of 14.
+
+Internal entries relocate against the p-sect being written, p-sect
+entries against the named section, and global entries against the
+named symbol -- which the directory read in the previous commit has
+already declared, reference or definition.  The displaced internal
+form names no symbol: its word is an absolute address, so it
+relocates against *ABS*.  Location counter definitions and
+modifications steer the stream rather than relocate anything, program
+limits store two words of their own, and the complex and
+resident-library forms have no counterpart here; all of those are
+consumed and nothing is emitted for them.
+
+Checked twice over.  Against an independent reading of the same
+records: all 136 relocations in the 112 modules of SYSLIB.OBJ agree on
+offset, kind, target and addend.  And against RT-11's own LINK: two
+modules linked on the machine, every relocation applied by hand from
+what objdump -r reports, and all 25 of them reproduce the word LINK
+wrote into the image -- 8 more could not be checked because LINK left
+those globals undefined.  Our own output reads back the same way, with
+all 41 relocations of a .ppu module reproducing LINK's image too.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ bfd/obj-pdp11.c | 256 ++++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 241 insertions(+), 15 deletions(-)
+
+diff -urN a/bfd/obj-pdp11.c b/bfd/obj-pdp11.c
+--- a/bfd/obj-pdp11.c	2026-10-10 01:08:51
++++ b/bfd/obj-pdp11.c	2026-10-10 01:08:51
+@@ -113,9 +113,33 @@
+ #define OBJ_GFLAG_DEF		0010	/* A definition, not a reference.  */
+ #define OBJ_GFLAG_REL		0040	/* Relative to its p-sect, not absolute.  */
+ 
+-/* The RLD entry that says where the following TXT goes.  */
+-#define OBJ_RLD_LOCCTR_DEF	7
++/* RLD entry types, from the manual's Table 2-5, which gives them in
++   octal.  */
++#define OBJ_RLD_INTERNAL	001
++#define OBJ_RLD_GLOBAL		002
++#define OBJ_RLD_INTERNAL_DISP	003
++#define OBJ_RLD_GLOBAL_DISP	004
++#define OBJ_RLD_GLOBAL_ADD	005
++#define OBJ_RLD_GLOBAL_ADD_DISP	006
++#define OBJ_RLD_LOCCTR_DEF	007
++#define OBJ_RLD_LOCCTR_MOD	010
++#define OBJ_RLD_LIMITS		011
++#define OBJ_RLD_PSECT		012
++#define OBJ_RLD_PSECT_DISP	014
++#define OBJ_RLD_PSECT_ADD	015
++#define OBJ_RLD_PSECT_ADD_DISP	016
++#define OBJ_RLD_COMPLEX		017
++#define OBJ_RLD_RESLIB		020
+ 
++/* Set in the command byte when the relocation is of a byte, not a
++   word.  */
++#define OBJ_RLD_BYTE		0200
++
++/* An RLD entry's displacement is measured from its TXT record's type
++   word, which is four bytes ahead of that record's data, so the first
++   relocatable word of a block reads as 4.  */
++#define OBJ_RLD_DISP_BIAS	4
++
+ /* The name RT-11 gives the absolute section, and the one this gives the
+    section whose own name is six spaces.  */
+ #define OBJ_ABS_NAME		". ABS."
+@@ -148,11 +172,62 @@
+ {
+   unsigned int pflags;		/* The p-sect flag byte, verbatim.  */
+   bfd_byte *contents;
++  arelent *relocs;
++  unsigned int relcount;	/* Counted, then filled.  */
+ };
+ 
+ #define obj_section_data(sec) \
+   ((struct obj_pdp11_section_data *) (sec)->used_by_bfd)
+ 
++/* A relocation is of a word or of a byte, and either plain or measured
++   from the program counter.  The names are a.out-pdp11's, since they
++   mean the same thing.  RT-11 keeps the addend in the RLD entry rather
++   than in the word being relocated, so none of these is partial
++   in-place.  */
++
++static reloc_howto_type obj_pdp11_howto_table[] =
++{
++  HOWTO (0, 0, 2, 16, false, 0, complain_overflow_dont, NULL,
++	 "16", false, 0x0000ffff, 0x0000ffff, false),
++  HOWTO (1, 0, 2, 16, true, 0, complain_overflow_dont, NULL,
++	 "DISP16", false, 0x0000ffff, 0x0000ffff, false),
++  HOWTO (2, 0, 1, 8, false, 0, complain_overflow_dont, NULL,
++	 "8", false, 0x000000ff, 0x000000ff, false),
++  HOWTO (3, 0, 1, 8, true, 0, complain_overflow_dont, NULL,
++	 "DISP8", false, 0x000000ff, 0x000000ff, false),
++};
++
++static reloc_howto_type *
++obj_pdp11_howto (bool byte, bool pcrel)
++{
++  return &obj_pdp11_howto_table[(byte ? 2 : 0) + (pcrel ? 1 : 0)];
++}
++
++static reloc_howto_type *
++obj_pdp11_reloc_type_lookup (bfd *abfd ATTRIBUTE_UNUSED,
++			     bfd_reloc_code_real_type code)
++{
++  switch (code)
++    {
++    case BFD_RELOC_16:		return obj_pdp11_howto (false, false);
++    case BFD_RELOC_16_PCREL:	return obj_pdp11_howto (false, true);
++    case BFD_RELOC_8:		return obj_pdp11_howto (true, false);
++    case BFD_RELOC_8_PCREL:	return obj_pdp11_howto (true, true);
++    default:			return NULL;
++    }
++}
++
++static reloc_howto_type *
++obj_pdp11_reloc_name_lookup (bfd *abfd ATTRIBUTE_UNUSED, const char *name)
++{
++  unsigned int i;
++
++  for (i = 0; i < ARRAY_SIZE (obj_pdp11_howto_table); i++)
++    if (strcasecmp (obj_pdp11_howto_table[i].name, name) == 0)
++      return &obj_pdp11_howto_table[i];
++  return NULL;
++}
++
+ /* How many bytes of argument an RLD entry of type CMD carries, after
+    the command and displacement bytes.  -1 for a type this does not
+    know, which ends the walk.  */
+@@ -251,7 +326,9 @@
+   asection *current;		/* Section the next TXT belongs to.  */
+   bfd_vma current_base;		/* Offset within it of the location counter.  */
+   asection *current_psect;	/* P-sect the GSD is listing globals under.  */
++  bfd_vma txt_offset;		/* Where in the section the last TXT went.  */
+   long symcount;		/* Globals counted, then globals filled.  */
++  bool counting;		/* Count relocations rather than build them.  */
+   bool saw_module_name;
+ };
+ 
+@@ -442,8 +519,108 @@
+   return true;
+ }
+ 
++/* The symbol a relocation is against, by the name an RLD entry
++   carries.  A p-sect's name names a section, and anything else names a
++   global the directory should have declared; one it did not is
++   undefined.  */
++
++static asymbol **
++obj_pdp11_reloc_symbol (bfd *abfd, const bfd_byte *rad50, bool psect)
++{
++  struct obj_pdp11_tdata *tdata = obj_tdata (abfd);
++  char *name = obj_pdp11_name (abfd, rad50);
++  long i;
++
++  if (name == NULL)
++    return &bfd_und_section_ptr->symbol;
++
++  if (psect)
++    {
++      asection *sec = bfd_get_section_by_name (abfd, name);
++
++      return sec != NULL ? &sec->symbol
++			 : &bfd_und_section_ptr->symbol;
++    }
++
++  for (i = 0; i < tdata->symcount; i++)
++    if (strcmp (tdata->syms[i]->name, name) == 0)
++      return &tdata->syms[i];
++
++  return &bfd_und_section_ptr->symbol;
++}
++
++/* Turns one RLD entry into a relocation of SEC.  Returns false for an
++   entry that is not one: a location counter definition or
++   modification, which steer the stream rather than relocate anything,
++   the program limits, which store two words of their own, and the
++   complex and resident-library forms, which have no counterpart here.
++   The displacement is measured from the TXT record's type word, so the
++   bias comes off it to reach an offset in the section.  */
++
++static bool
++obj_pdp11_rld_to_reloc (bfd *abfd, struct obj_pdp11_walk *walk,
++			unsigned int cmd, unsigned int disp,
++			const bfd_byte *arg, arelent *reloc)
++{
++  asymbol **sym;
++  bfd_vma addend = 0;
++  bool pcrel = false;
++
++  switch (cmd & 0x7f)
++    {
++    case OBJ_RLD_INTERNAL:
++    case OBJ_RLD_INTERNAL_DISP:
++      /* Plain: the word is an offset into the p-sect being written.
++	 Displaced: it is the absolute address to measure from.  */
++      pcrel = (cmd & 0x7f) == OBJ_RLD_INTERNAL_DISP;
++      addend = bfd_getl16 (arg);
++      sym = pcrel ? &bfd_abs_section_ptr->symbol
++		  : &walk->current->symbol;
++      break;
++
++    case OBJ_RLD_GLOBAL:
++    case OBJ_RLD_GLOBAL_DISP:
++      pcrel = (cmd & 0x7f) == OBJ_RLD_GLOBAL_DISP;
++      sym = obj_pdp11_reloc_symbol (abfd, arg, false);
++      break;
++
++    case OBJ_RLD_GLOBAL_ADD:
++    case OBJ_RLD_GLOBAL_ADD_DISP:
++      pcrel = (cmd & 0x7f) == OBJ_RLD_GLOBAL_ADD_DISP;
++      sym = obj_pdp11_reloc_symbol (abfd, arg, false);
++      addend = bfd_getl16 (arg + 4);
++      break;
++
++    case OBJ_RLD_PSECT:
++    case OBJ_RLD_PSECT_DISP:
++      pcrel = (cmd & 0x7f) == OBJ_RLD_PSECT_DISP;
++      sym = obj_pdp11_reloc_symbol (abfd, arg, true);
++      break;
++
++    case OBJ_RLD_PSECT_ADD:
++    case OBJ_RLD_PSECT_ADD_DISP:
++      pcrel = (cmd & 0x7f) == OBJ_RLD_PSECT_ADD_DISP;
++      sym = obj_pdp11_reloc_symbol (abfd, arg, true);
++      addend = bfd_getl16 (arg + 4);
++      break;
++
++    default:
++      return false;
++    }
++
++  if (disp < OBJ_RLD_DISP_BIAS)
++    return false;
++
++  reloc->sym_ptr_ptr = sym;
++  reloc->address = walk->txt_offset + disp - OBJ_RLD_DISP_BIAS;
++  reloc->addend = addend;
++  reloc->howto = obj_pdp11_howto ((cmd & OBJ_RLD_BYTE) != 0, pcrel);
++  return true;
++}
++
+ /* Third pass: the text, steered by the location counter definitions in
+-   the relocation records.  */
++   the relocation records, and the relocations themselves -- counted on
++   the way through once, then built.  */
+ 
+ static bool
+ obj_pdp11_scan_text (struct obj_pdp11_walk *walk, unsigned int type,
+@@ -476,7 +653,26 @@
+ 		  walk->current_base = bfd_getl16 (body + k + 6);
+ 		}
+ 	    }
++	  else if (walk->current != NULL)
++	    {
++	      struct obj_pdp11_section_data *data
++		= obj_section_data (walk->current);
++	      arelent scratch;
++	      arelent *into = &scratch;
+ 
++	      if (data == NULL)
++		break;
++	      if (!walk->counting)
++		{
++		  if (data->relcount >= walk->current->reloc_count)
++		    break;
++		  into = &data->relocs[data->relcount];
++		}
++	      if (obj_pdp11_rld_to_reloc (abfd, walk, body[k], body[k + 1],
++					  body + k + 2, into))
++		data->relcount++;
++	    }
++
+ 	  k += 2 + (size_t) arg;
+ 	}
+ 
+@@ -497,6 +693,7 @@
+       else
+ 	where = 0;
+ 
++      walk->txt_offset = where;
+       if (contents != NULL && where + n <= walk->current->size)
+ 	memcpy (contents + where, body + 2, n);
+     }
+@@ -580,10 +777,33 @@
+       tdata->syms[tdata->symcount] = NULL;
+     }
+ 
++  /* The text, and the relocations with it: once to count them, and
++     again to build them once each section knows how many it has.  */
+   walk.fn = obj_pdp11_scan_text;
+   walk.current = NULL;
++  walk.counting = true;
+   obj_pdp11_walk_records (&walk, buf, size);
+ 
++  for (sec = abfd->sections; sec != NULL; sec = sec->next)
++    {
++      struct obj_pdp11_section_data *data = obj_section_data (sec);
++
++      if (data == NULL || data->relcount == 0)
++	continue;
++
++      sec->reloc_count = data->relcount;
++      data->relocs = (arelent *) bfd_alloc (abfd,
++					    data->relcount * sizeof (arelent));
++      if (data->relocs == NULL)
++	goto fail;
++      data->relcount = 0;
++      sec->flags |= SEC_RELOC;
++    }
++
++  walk.current = NULL;
++  walk.counting = false;
++  obj_pdp11_walk_records (&walk, buf, size);
++
+   free (buf);
+ 
+   abfd->flags |= HAS_SYMS | HAS_RELOC;
+@@ -675,24 +895,30 @@
+     }
+ }
+ 
+-/* Relocations come next; a module without them still disassembles,
+-   which is what this much is for.  */
+-
+ static long
+-obj_pdp11_get_reloc_upper_bound (bfd *abfd ATTRIBUTE_UNUSED,
+-				 asection *sec ATTRIBUTE_UNUSED)
++obj_pdp11_get_reloc_upper_bound (bfd *abfd ATTRIBUTE_UNUSED, asection *sec)
+ {
+-  return sizeof (arelent *);
++  return (sec->reloc_count + 1) * sizeof (arelent *);
+ }
+ 
+ static long
+-obj_pdp11_canonicalize_reloc (bfd *abfd ATTRIBUTE_UNUSED,
+-			      asection *sec ATTRIBUTE_UNUSED,
++obj_pdp11_canonicalize_reloc (bfd *abfd ATTRIBUTE_UNUSED, asection *sec,
+ 			      arelent **relptr,
+ 			      asymbol **symbols ATTRIBUTE_UNUSED)
+ {
+-  *relptr = NULL;
+-  return 0;
++  struct obj_pdp11_section_data *data = obj_section_data (sec);
++  unsigned int i;
++
++  if (data == NULL || data->relocs == NULL)
++    {
++      *relptr = NULL;
++      return 0;
++    }
++
++  for (i = 0; i < sec->reloc_count; i++)
++    relptr[i] = &data->relocs[i];
++  relptr[i] = NULL;
++  return sec->reloc_count;
+ }
+ 
+ static void
+@@ -739,8 +965,8 @@
+ #define obj_pdp11_bfd_make_debug_symbol	  _bfd_nosymbols_bfd_make_debug_symbol
+ #define obj_pdp11_read_minisymbols	  _bfd_generic_read_minisymbols
+ #define obj_pdp11_minisymbol_to_symbol	  _bfd_generic_minisymbol_to_symbol
+-#define obj_pdp11_bfd_reloc_type_lookup	  _bfd_norelocs_bfd_reloc_type_lookup
+-#define obj_pdp11_bfd_reloc_name_lookup	  _bfd_norelocs_bfd_reloc_name_lookup
++#define obj_pdp11_bfd_reloc_type_lookup	  obj_pdp11_reloc_type_lookup
++#define obj_pdp11_bfd_reloc_name_lookup	  obj_pdp11_reloc_name_lookup
+ #define obj_pdp11_set_arch_mach		  _bfd_generic_set_arch_mach
+ #define obj_pdp11_sizeof_headers	  _bfd_nolink_sizeof_headers
+ #define obj_pdp11_bfd_get_relocated_section_contents \
