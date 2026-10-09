@@ -40,10 +40,10 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
  bfd/Makefile.am        |   4 +-
  bfd/Makefile.in        |   7 +-
  bfd/config.bfd         |   4 +-
- bfd/obj-pdp11.c        | 702 +++++++++++++++++++++++++++++++++++++++++
+ bfd/obj-pdp11.c        | 706 +++++++++++++++++++++++++++++++++++++++++
  bfd/po/SRC-POTFILES.in |   1 +
  bfd/targets.c          |   7 +
- 6 files changed, 719 insertions(+), 6 deletions(-)
+ 6 files changed, 723 insertions(+), 6 deletions(-)
  create mode 100644 bfd/obj-pdp11.c
 
 diff -urN a/bfd/Makefile.am b/bfd/Makefile.am
@@ -122,7 +122,7 @@ diff -urN a/bfd/config.bfd b/bfd/config.bfd
 diff -urN a/bfd/obj-pdp11.c b/bfd/obj-pdp11.c
 --- a/bfd/obj-pdp11.c	1970-01-01 03:00:00
 +++ b/bfd/obj-pdp11.c	2026-10-09 23:53:12
-@@ -0,0 +1,702 @@
+@@ -0,0 +1,706 @@
 +/* BFD back-end for RT-11 relocatable object modules (PDP-11).
 +   Copyright (C) 2026 Free Software Foundation, Inc.
 +
@@ -167,8 +167,10 @@ diff -urN a/bfd/obj-pdp11.c b/bfd/obj-pdp11.c
 +   those are not read here yet.
 +
 +   Names are RADIX-50: three characters to a 16-bit word, from the
-+   alphabet " ABCDEFGHIJKLMNOPQRSTUVWXYZ$.0123456789", so six characters
-+   to a pair of words and no lower case.
++   alphabet " ABCDEFGHIJKLMNOPQRSTUVWXYZ$." -- then one code DEC
++   leaves unused, and only then "0123456789", so the digits are 30 to
++   39 and not 29 to 38.  Six characters to a pair of words, and no
++   lower case.
 +
 +   A GSD entry is eight bytes: four of name, one of flags, one of entry
 +   type, two of value.  The types this reads are module name (0), global
@@ -308,7 +310,9 @@ diff -urN a/bfd/obj-pdp11.c b/bfd/obj-pdp11.c
 +static void
 +obj_pdp11_unrad50 (unsigned int word, char *out)
 +{
-+  static const char alphabet[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ$.0123456789";
++  /* All forty codes, so that the digits land where DEC puts them; 29
++     is the one DEC does not use.  */
++  static const char alphabet[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ$.?0123456789";
 +  unsigned int divisor = 1600;
 +  int i;
 +

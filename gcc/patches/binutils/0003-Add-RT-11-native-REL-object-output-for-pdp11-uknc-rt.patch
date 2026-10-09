@@ -419,7 +419,7 @@ index 0000000..d0f9f4f
 +  if (c == '.')
 +    return 28;
 +  if (c >= '0' && c <= '9')
-+    return 36 + (c - '0');
++    return 30 + (c - '0');	/* 29 is the code DEC leaves unused.  */
 +  return -1;
 +}
 +
