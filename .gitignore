@@ -11,6 +11,11 @@
 example.dsk
 *.a
 *.dsk
+# ...except the two images this project ships: the system one that
+# programs are run on, and the one with MACRO, LINK and LIBR for
+# working on the RT-11 object format.
+!resources/rt11os.dsk
+!resources/rt11dev.dsk
 *.ppu
 /gcc/autotools
 /debugger/bin
