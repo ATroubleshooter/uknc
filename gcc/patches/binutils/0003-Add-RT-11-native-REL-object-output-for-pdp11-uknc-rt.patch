@@ -59,8 +59,8 @@ reader is done with it.
  ld/Makefile.in                |   2 +
  ld/configure.tgt              |   2 +-
  ld/emulparams/pdp11rt11rel.sh |  23 +
- ld/emultempl/pdp11rt11rel.em  | 877 ++++++++++++++++++++++++++++++++++
- 5 files changed, 904 insertions(+), 1 deletion(-)
+ ld/emultempl/pdp11rt11rel.em  | 883 ++++++++++++++++++++++++++++++++++
+ 5 files changed, 910 insertions(+), 1 deletion(-)
  create mode 100644 ld/emulparams/pdp11rt11rel.sh
  create mode 100644 ld/emultempl/pdp11rt11rel.em
 
@@ -143,7 +143,7 @@ new file mode 100644
 index 0000000..d0f9f4f
 --- /dev/null
 +++ b/ld/emultempl/pdp11rt11rel.em
-@@ -0,0 +1,877 @@
+@@ -0,0 +1,883 @@
 +# This shell script emits a C file. -*- C -*-
 +#   Copyright (C) 2026 Free Software Foundation, Inc.
 +#
@@ -354,9 +354,11 @@ index 0000000..d0f9f4f
 +
 +   TXT block chunking: an RLD entry leads with its command byte and
 +   then one displacement byte (0-255), relative to the *immediately
-+   preceding* TXT block's own load address -- so section content is
-+   chunked into REL_TXT_CHUNK pieces well under that limit, each with
-+   its own load address, rather than emitted as one large blob.  */
++   preceding* TXT block -- four for that record's own header words and
++   then the offset into its data, so the first relocatable word of a
++   block has displacement 4.  Content is chunked into REL_TXT_CHUNK
++   pieces well under the byte's limit, each with its own load address,
++   rather than emitted as one large blob.  */
 +
 +#include "bfdlink.h"
 +#include <ctype.h>
@@ -789,7 +791,11 @@ index 0000000..d0f9f4f
 +	  if (addr < chunk_start || addr >= chunk_start + chunk_len)
 +	    continue;
 +
-+	  disp = (unsigned int) (addr - chunk_start);
++	  /* Measured from the record's type word, which is four bytes
++	     ahead of its data: LINK relocates the word at the
++	     displacement it is given, so leaving the four out moves
++	     every relocation in the module two words early.  */
++	  disp = (unsigned int) (addr - chunk_start) + 4;
 +	  pcrel = rel->howto != NULL && rel->howto->pc_relative;
 +	  constant = bfd_getl16 (contents + addr);
 +	  sym = *rel->sym_ptr_ptr;

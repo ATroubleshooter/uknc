@@ -171,9 +171,12 @@ static int apply_rld_block(const struct block *blk,
 
   while (j + 2 <= blk->body_len) {
     // An RLD entry leads with its command byte; the displacement
-    // byte, into the preceding TXT block, follows it.
+    // byte, into the preceding TXT block, follows it. The displacement
+    // is measured from that block's type word, four bytes ahead of its
+    // data, so the first relocatable word of a block reads as 4.
     unsigned int rtype = blk->body[j];
     unsigned int disp = blk->body[j + 1];
+    unsigned int off;
     unsigned int target_base, addend;
     unsigned short patched;
     int p;
@@ -196,7 +199,11 @@ static int apply_rld_block(const struct block *blk,
     if (!*have_chunk || *cur_psect < 0 || *cur_psect == PSECT_ABS) {
       return 0;
     }
-    if (disp + 2 > chunk_len || (disp & 1) != 0) {
+    if (disp < 4) {
+      return 0;
+    }
+    off = disp - 4;
+    if (off + 2 > chunk_len || (off & 1) != 0) {
       return 0;
     }
 
@@ -262,8 +269,8 @@ static int apply_rld_block(const struct block *blk,
     }
 
     patched = (unsigned short)(target_base + addend);
-    chunk_ptr[disp] = (unsigned char)patched;
-    chunk_ptr[disp + 1] = (unsigned char)(patched >> 8);
+    chunk_ptr[off] = (unsigned char)patched;
+    chunk_ptr[off + 1] = (unsigned char)(patched >> 8);
   }
 
   return 1;
