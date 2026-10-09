@@ -1,0 +1,642 @@
+From: Yury Klushin <digger@live.ru>
+Date: Fri, 10 Oct 2026 00:00:00 +0300
+Subject: [PATCH] Write an RT-11 object module through BFD
+
+The format becomes writable, so a module comes out of the ordinary BFD
+path -- objcopy -O obj-pdp11, or ld --oformat obj-pdp11 -- instead of
+only out of the pdp11rt11rel linker emulation, which repacks a
+finished link behind the linker's back.  That emulation stays as it is:
+it is what builds the .ppu modules libs/libppu loads, and its narrower
+output is what that loader accepts.
+
+Sections become p-sects, keeping the flag byte a module came with so
+that a round trip does not lose the overlay bit; symbols become the
+global symbol directory, definitions under the p-sect they are in and
+references under ". ABS.", which is the order a directory has to be
+in; contents go out as TXT records chunked well inside the one byte a
+displacement has; and relocations become RLD entries -- internal for a
+reference inside the p-sect being written, the named p-sect forms for
+one that crosses or is measured from the program counter, the global
+forms for a symbol by name.  A plain reference to an absolute value
+gets no entry at all: nothing about it moves, so the value goes in the
+word.
+
+Names are folded to what RADIX-50 can hold: upper case, '.' for the
+underscore C names are full of and for anything else that will not
+fit.  The reader does not undo that, because it cannot -- so a C
+symbol a module reaches by name is spelled in the C source the way the
+module spells it, with asm ("NAME").
+
+Checked by reading all 112 modules of SYSLIB.OBJ, writing each one
+back out and reading it again: sections, symbols, relocations and
+contents all come back identical.  And against RT-11's own LINK, which
+is the point: a module made the new way out of a C file -- ld -r, then
+objcopy -O obj-pdp11 -- links on the machine with no diagnostics at
+all, its map agreeing with what our own reader says about it, and the
+two relocated words in the image are what RT-11 computes, a pointer in
+.DATA holding the address its array was placed at and a displaced
+reference from .TEXT reaching it.
+
+ld -r across formats is refused by ld itself, so an ELF object does
+not become a module in one step; that is what ld -r followed by
+objcopy is for.  With modules on both sides it works, and two RT-11
+modules now combine into one.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ bfd/obj-pdp11.c | 546 +++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 536 insertions(+), 10 deletions(-)
+
+diff -urN a/bfd/obj-pdp11.c b/bfd/obj-pdp11.c
+--- a/bfd/obj-pdp11.c	2026-10-10 01:42:54
++++ b/bfd/obj-pdp11.c	2026-10-10 01:42:54
+@@ -433,8 +433,7 @@
+ 	    return false;
+ 	  sec->size = value;
+ 	  sec->alignment_power = 1;
+-	  sec->used_by_bfd = bfd_zalloc (abfd, sizeof (*obj_section_data (sec)));
+-	  if (sec->used_by_bfd == NULL)
++	  if (obj_section_data (sec) == NULL)
+ 	    return false;
+ 	  obj_section_data (sec)->pflags = flags;
+ 	  walk->current_psect = sec;
+@@ -959,10 +958,539 @@
+   return false;
+ }
+ 
++
++/* ---- writing ---- */
++
++/* RADIX-50 holds six characters from a forty-character alphabet: no
++   lower case, no underscore.  So a name that is not already one has to
++   be folded -- upper case, and '.' for the underscore C names are full
++   of and for anything else that will not fit.  The reader does not undo
++   this, because it cannot: a C symbol that a module has to reach by
++   name is spelled in the C source the way the module spells it, with
++   asm ("NAME").  */
++
++static unsigned int
++obj_pdp11_rad50_char (char c)
++{
++  if (c == ' ')
++    return 0;
++  if (c >= 'A' && c <= 'Z')
++    return 1 + (unsigned int) (c - 'A');
++  if (c >= 'a' && c <= 'z')
++    return 1 + (unsigned int) (c - 'a');
++  if (c == '$')
++    return 27;
++  if (c >= '0' && c <= '9')
++    return 30 + (unsigned int) (c - '0');
++  return 28;			/* '.', and whatever else cannot be held.  */
++}
++
++/* What this writer is building, before it reaches the file: records are
++   checksummed over their own bytes, so each one is laid out whole.  */
++
++struct obj_pdp11_out
++{
++  bfd *abfd;
++  bfd_byte *buf;
++  size_t len;
++  size_t alloc;
++  bool fail;
++};
++
++static void
++obj_pdp11_room (struct obj_pdp11_out *o, size_t n)
++{
++  if (o->len + n <= o->alloc)
++    return;
++
++  o->alloc = (o->len + n) * 2 + 64;
++  o->buf = (bfd_byte *) bfd_realloc (o->buf, o->alloc);
++  if (o->buf == NULL)
++    {
++      o->fail = true;
++      o->alloc = o->len = 0;
++    }
++}
++
++static void
++obj_pdp11_byte (struct obj_pdp11_out *o, unsigned int v)
++{
++  obj_pdp11_room (o, 1);
++  if (!o->fail)
++    o->buf[o->len++] = (bfd_byte) (v & 0xff);
++}
++
++static void
++obj_pdp11_word (struct obj_pdp11_out *o, unsigned int v)
++{
++  obj_pdp11_room (o, 2);
++  if (!o->fail)
++    {
++      bfd_putl16 (v & 0xffff, o->buf + o->len);
++      o->len += 2;
++    }
++}
++
++static void
++obj_pdp11_bytes (struct obj_pdp11_out *o, const bfd_byte *p, size_t n)
++{
++  obj_pdp11_room (o, n);
++  if (!o->fail)
++    {
++      memcpy (o->buf + o->len, p, n);
++      o->len += n;
++    }
++}
++
++/* NAME in RADIX-50, six characters of it, blank-padded.  The blank
++   p-sect is the one whose name really is six blanks; the reader calls
++   it ". BLANK." so that it has a name at all.  */
++
++static void
++obj_pdp11_put_name (struct obj_pdp11_out *o, const char *name)
++{
++  char six[6];
++  int i;
++
++  if (strcmp (name, OBJ_BLANK_NAME) == 0)
++    name = "";
++
++  for (i = 0; i < 6; i++)
++    six[i] = ' ';
++  for (i = 0; i < 6 && name[i] != '\0'; i++)
++    six[i] = name[i];
++
++  for (i = 0; i < 6; i += 3)
++    obj_pdp11_word (o, (obj_pdp11_rad50_char (six[i]) * 40
++			+ obj_pdp11_rad50_char (six[i + 1])) * 40
++		       + obj_pdp11_rad50_char (six[i + 2]));
++}
++
++/* Wrap what has been built as a record of TYPE and write it out: the
++   two marks, the length over them and itself, the type, the payload,
++   and a checksum chosen to bring the record's bytes to zero.  */
++
++static bool
++obj_pdp11_record (struct obj_pdp11_out *o, unsigned int type)
++{
++  bfd_byte header[OBJ_REC_HEADER];
++  size_t length = OBJ_REC_HEADER + o->len;
++  size_t payload = o->len;
++  size_t k;
++  unsigned int sum = 0;
++  bfd_byte checksum;
++
++  o->len = 0;
++  if (o->fail)
++    return false;
++
++  header[0] = OBJ_REC_MARK1;
++  header[1] = OBJ_REC_MARK2;
++  bfd_putl16 (length, header + 2);
++  bfd_putl16 (type, header + 4);
++
++  for (k = 0; k < sizeof (header); k++)
++    sum += header[k];
++  for (k = 0; k < payload; k++)
++    sum += o->buf[k];
++  checksum = (bfd_byte) ((0u - sum) & 0xff);
++
++  if (bfd_write (header, sizeof (header), o->abfd) != sizeof (header))
++    return false;
++  if (payload != 0
++      && bfd_write (o->buf, payload, o->abfd) != payload)
++    return false;
++  return bfd_write (&checksum, 1, o->abfd) == 1;
++}
++
++/* The p-sect flag byte for SEC.  A module this read keeps the byte it
++   came with, overlay bit and all; one the linker built gets the three
++   bits that have a counterpart here.  */
++
++static unsigned int
++obj_pdp11_psect_flags (asection *sec)
++{
++  struct obj_pdp11_section_data *data = obj_section_data (sec);
++  unsigned int flags;
++
++  if (data != NULL && data->pflags != 0)
++    return data->pflags;
++
++  if (strcmp (sec->name, OBJ_ABS_NAME) == 0)
++    return OBJ_PFLAG_GBL | OBJ_PFLAG_OVR;
++
++  flags = OBJ_PFLAG_REL;
++  if ((sec->flags & SEC_CODE) == 0)
++    flags |= OBJ_PFLAG_DATA;
++  return flags;
++}
++
++/* Where a symbol will be once written, and what its value is there.
++   What comes in is the input file's own symbol, still pointing at the
++   input file's section, so it has to be followed through to the
++   section that one became part of.  */
++
++static asection *
++obj_pdp11_sym_section (asymbol *sym, bfd_vma *value)
++{
++  asection *sec = bfd_asymbol_section (sym);
++
++  *value = sym->value;
++  if (sec != NULL && sec->output_section != NULL && sec->output_section != sec)
++    {
++      *value += sec->output_offset;
++      sec = sec->output_section;
++    }
++  return sec;
++}
++
++/* One eight-byte directory entry: the name, the flag byte, the entry
++   type and a value word.  */
++
++static void
++obj_pdp11_gsd_entry (struct obj_pdp11_out *o, const char *name,
++		     unsigned int flags, unsigned int type, bfd_vma value)
++{
++  obj_pdp11_put_name (o, name);
++  obj_pdp11_byte (o, flags);
++  obj_pdp11_byte (o, type);
++  obj_pdp11_word (o, (unsigned int) value);
++}
++
++/* The module's own name: the one it was read with, or the output file's,
++   folded to what RADIX-50 can hold.  */
++
++static const char *
++obj_pdp11_module_name (bfd *abfd)
++{
++  static char name[7];
++  const char *file = bfd_get_filename (abfd);
++  const char *base;
++  size_t i;
++
++  if (obj_tdata (abfd)->module[0] != '\0')
++    return obj_tdata (abfd)->module;
++
++  base = file != NULL ? strrchr (file, '/') : NULL;
++  base = base != NULL ? base + 1 : (file != NULL ? file : "OBJ");
++  for (i = 0; i < 6 && base[i] != '\0' && base[i] != '.'; i++)
++    name[i] = base[i];
++  name[i] = '\0';
++  return name[0] != '\0' ? name : "OBJ";
++}
++
++/* The global symbol directory: the module's name, then the absolute
++   section with every undefined reference under it, then each p-sect
++   with the globals defined in it -- the order a directory has to be in,
++   since a global belongs to the p-sect declared before it.  */
++
++static bool
++obj_pdp11_write_gsd (bfd *abfd, struct obj_pdp11_out *o)
++{
++  asymbol **syms = bfd_get_outsymbols (abfd);
++  long symcount = bfd_get_symcount (abfd);
++  asection *sec;
++  asection *abs_sec = bfd_get_section_by_name (abfd, OBJ_ABS_NAME);
++  long i;
++
++  obj_pdp11_gsd_entry (o, obj_pdp11_module_name (abfd), 0,
++		       OBJ_GSD_MODNAME, 0);
++
++  /* ". ABS.", and under it what is undefined or absolute.  */
++  obj_pdp11_gsd_entry (o, OBJ_ABS_NAME,
++		       abs_sec != NULL ? obj_pdp11_psect_flags (abs_sec)
++				       : (OBJ_PFLAG_GBL | OBJ_PFLAG_OVR),
++		       OBJ_GSD_PSECT, abs_sec != NULL ? abs_sec->size : 0);
++
++  for (i = 0; i < symcount; i++)
++    {
++      asymbol *sym = syms[i];
++      bfd_vma value;
++      asection *ssec = obj_pdp11_sym_section (sym, &value);
++
++      if ((sym->flags & BSF_SECTION_SYM) != 0)
++	continue;
++      if (bfd_is_und_section (ssec))
++	obj_pdp11_gsd_entry (o, sym->name, 0, OBJ_GSD_GLOBAL, 0);
++      else if (bfd_is_abs_section (ssec)
++	       && (sym->flags & (BSF_GLOBAL | BSF_WEAK)) != 0)
++	obj_pdp11_gsd_entry (o, sym->name, OBJ_GFLAG_DEF, OBJ_GSD_GLOBAL,
++			     value);
++    }
++
++  for (sec = abfd->sections; sec != NULL; sec = sec->next)
++    {
++      if (sec == abs_sec || (sec->flags & SEC_ALLOC) == 0)
++	continue;
++
++      obj_pdp11_gsd_entry (o, sec->name, obj_pdp11_psect_flags (sec),
++			   OBJ_GSD_PSECT, sec->size);
++
++      for (i = 0; i < symcount; i++)
++	{
++	  asymbol *sym = syms[i];
++	  bfd_vma value;
++
++	  if ((sym->flags & BSF_SECTION_SYM) != 0
++	      || (sym->flags & (BSF_GLOBAL | BSF_WEAK)) == 0
++	      || obj_pdp11_sym_section (sym, &value) != sec)
++	    continue;
++	  obj_pdp11_gsd_entry (o, sym->name, OBJ_GFLAG_DEF | OBJ_GFLAG_REL,
++			       OBJ_GSD_GLOBAL, value);
++	}
++    }
++
++  /* The transfer address, which for a module there is not one of: an
++     odd value is how RT-11 says so.  */
++  obj_pdp11_gsd_entry (o, OBJ_ABS_NAME, OBJ_GFLAG_DEF, OBJ_GSD_XFER,
++		       obj_tdata (abfd)->start != (bfd_vma) -1
++		       ? obj_tdata (abfd)->start : 1);
++
++  return obj_pdp11_record (o, OBJ_BLK_GSD)
++	 && obj_pdp11_record (o, OBJ_BLK_ENDGSD);
++}
++
++/* An absolute reference moves nothing, so it needs no relocation
++   record: the value goes straight into the word.  bfd_perform_relocation
++   leaves the word alone for a relocation whose addend is not in it, so
++   this is where it gets written.  */
++
++static void
++obj_pdp11_resolve_absolute (asection *sec, struct obj_pdp11_section_data *data)
++{
++  unsigned int k;
++
++  for (k = 0; k < sec->reloc_count; k++)
++    {
++      arelent *rel = sec->orelocation[k];
++      asymbol *sym;
++
++      if (rel == NULL || rel->howto == NULL || rel->howto->pc_relative)
++	continue;
++      sym = *rel->sym_ptr_ptr;
++      if (!bfd_is_abs_section (bfd_asymbol_section (sym)))
++	continue;
++      if (rel->address + 2 > sec->size)
++	continue;
++      bfd_putl16 ((sym->value + rel->addend) & 0xffff,
++		  data->contents + rel->address);
++    }
++}
++
++/* Turns one BFD relocation into an RLD entry.  Returns false when there
++   is none to write, which is the absolute case above.  */
++
++static bool
++obj_pdp11_reloc_to_rld (struct obj_pdp11_out *o, asection *sec,
++			arelent *rel, unsigned int disp)
++{
++  asymbol *sym = *rel->sym_ptr_ptr;
++  bfd_vma symvalue;
++  asection *target = obj_pdp11_sym_section (sym, &symvalue);
++  bool pcrel = rel->howto != NULL && rel->howto->pc_relative;
++  bool byte = rel->howto != NULL && bfd_get_reloc_size (rel->howto) == 1;
++  /* The reader takes two off a displacement for BFD's sake; RT-11 wants
++     them back, since it measures from the word after the one being
++     relocated.  */
++  bfd_vma addend = rel->addend + (pcrel ? 2 : 0);
++  const char *name = NULL;
++  unsigned int cmd;
++  bool constant;
++
++  if (bfd_is_und_section (target))
++    {
++      name = sym->name;
++      constant = addend != 0;
++      if (constant)
++	cmd = pcrel ? OBJ_RLD_GLOBAL_ADD_DISP : OBJ_RLD_GLOBAL_ADD;
++      else
++	cmd = pcrel ? OBJ_RLD_GLOBAL_DISP : OBJ_RLD_GLOBAL;
++    }
++  else if (bfd_is_abs_section (target))
++    {
++      if (!pcrel)
++	return false;
++      /* The word holds the address to measure from, which is what the
++	 displaced internal form means.  */
++      cmd = OBJ_RLD_INTERNAL_DISP;
++      addend += symvalue;
++      constant = true;
++    }
++  else if (!pcrel && target == sec)
++    {
++      cmd = OBJ_RLD_INTERNAL;
++      addend += symvalue;
++      constant = true;
++    }
++  else
++    {
++      /* Another p-sect, or this one reached from the program counter --
++	 a distance between two p-sects changes when they are placed,
++	 so it is the named form either way.  */
++      name = target->name;
++      addend += symvalue;
++      constant = addend != 0;
++      if (constant)
++	cmd = pcrel ? OBJ_RLD_PSECT_ADD_DISP : OBJ_RLD_PSECT_ADD;
++      else
++	cmd = pcrel ? OBJ_RLD_PSECT_DISP : OBJ_RLD_PSECT;
++    }
++
++  obj_pdp11_byte (o, cmd | (byte ? OBJ_RLD_BYTE : 0));
++  obj_pdp11_byte (o, disp);
++  if (name != NULL)
++    obj_pdp11_put_name (o, name);
++  if (constant)
++    obj_pdp11_word (o, (unsigned int) addend);
++  return true;
++}
++
++/* A TXT record's data is reached by a one-byte displacement, so a
++   p-sect goes out in pieces well inside that.  */
++#define OBJ_TXT_CHUNK		128
++
++static bool
++obj_pdp11_write_object_contents (bfd *abfd)
++{
++  struct obj_pdp11_out o;
++  asection *sec;
++  bool ok;
++
++  memset (&o, 0, sizeof (o));
++  o.abfd = abfd;
++
++  if (bfd_seek (abfd, 0, SEEK_SET) != 0)
++    return false;
++
++  ok = obj_pdp11_write_gsd (abfd, &o);
++
++  for (sec = abfd->sections; ok && sec != NULL; sec = sec->next)
++    {
++      struct obj_pdp11_section_data *data = obj_section_data (sec);
++      bfd_vma at;
++
++      if ((sec->flags & SEC_HAS_CONTENTS) == 0 || sec->size == 0
++	  || data == NULL || data->contents == NULL)
++	continue;
++
++      if (sec->orelocation != NULL)
++	obj_pdp11_resolve_absolute (sec, data);
++
++      /* Where the words that follow belong.  */
++      obj_pdp11_byte (&o, OBJ_RLD_LOCCTR_DEF);
++      obj_pdp11_byte (&o, 0);
++      obj_pdp11_put_name (&o, sec->name);
++      obj_pdp11_word (&o, 0);
++      ok = obj_pdp11_record (&o, OBJ_BLK_RLD);
++
++      for (at = 0; ok && at < sec->size; at += OBJ_TXT_CHUNK)
++	{
++	  bfd_size_type n = sec->size - at;
++	  unsigned int k;
++
++	  if (n > OBJ_TXT_CHUNK)
++	    n = OBJ_TXT_CHUNK;
++
++	  obj_pdp11_word (&o, (unsigned int) at);
++	  obj_pdp11_bytes (&o, data->contents + at, (size_t) n);
++	  ok = obj_pdp11_record (&o, OBJ_BLK_TXT);
++
++	  for (k = 0; ok && sec->orelocation != NULL && k < sec->reloc_count;
++	       k++)
++	    {
++	      arelent *rel = sec->orelocation[k];
++
++	      if (rel == NULL || rel->address < at || rel->address >= at + n)
++		continue;
++	      obj_pdp11_reloc_to_rld (&o, sec, rel,
++				      (unsigned int) (rel->address - at)
++				      + OBJ_RLD_DISP_BIAS);
++	    }
++	  if (ok && o.len != 0)
++	    ok = obj_pdp11_record (&o, OBJ_BLK_RLD);
++	}
++    }
++
++  if (ok)
++    ok = obj_pdp11_record (&o, OBJ_BLK_ENDMOD);
++
++  free (o.buf);
++  return ok;
++}
++
++/* Collecting a section's contents, which the records above are built
++   from rather than written straight to the file.  */
++
++static bool
++obj_pdp11_set_section_contents (bfd *abfd, asection *sec,
++				const void *location, file_ptr offset,
++				bfd_size_type count)
++{
++  struct obj_pdp11_section_data *data = obj_section_data (sec);
++
++  if (count == 0)
++    return true;
++  if (data == NULL || (sec->flags & SEC_HAS_CONTENTS) == 0)
++    return true;
++
++  if (data->contents == NULL)
++    {
++      data->contents = (bfd_byte *) bfd_zalloc (abfd, sec->size);
++      if (data->contents == NULL)
++	return false;
++    }
++
++  if ((bfd_vma) offset + count > sec->size)
++    {
++      bfd_set_error (bfd_error_bad_value);
++      return false;
++    }
++
++  memcpy (data->contents + offset, location, (size_t) count);
++  return true;
++}
++
++/* Nothing in a module comes before its first record.  */
++
++static int
++obj_pdp11_sizeof_headers (bfd *abfd ATTRIBUTE_UNUSED,
++			  struct bfd_link_info *info ATTRIBUTE_UNUSED)
++{
++  return 0;
++}
++
++/* The module's name and its transfer address belong to the module, not
++   to any section or symbol, so objcopy has to be told to carry them
++   over.  */
++
++static bool
++obj_pdp11_copy_private_bfd_data (bfd *ibfd, bfd *obfd)
++{
++  if (bfd_get_flavour (ibfd) != bfd_target_unknown_flavour
++      || bfd_get_flavour (obfd) != bfd_target_unknown_flavour
++      || ibfd->xvec != obfd->xvec)
++    return true;
++
++  memcpy (obj_tdata (obfd)->module, obj_tdata (ibfd)->module,
++	  sizeof (obj_tdata (obfd)->module));
++  obj_tdata (obfd)->start = obj_tdata (ibfd)->start;
++  return true;
++}
++
++static bool
++obj_pdp11_new_section_hook (bfd *abfd, asection *sec)
++{
++  if (sec->used_by_bfd == NULL)
++    {
++      sec->used_by_bfd = bfd_zalloc (abfd, sizeof (*obj_section_data (sec)));
++      if (sec->used_by_bfd == NULL)
++	return false;
++    }
++  return _bfd_generic_new_section_hook (abfd, sec);
++}
++
+ #define obj_pdp11_close_and_cleanup	  _bfd_generic_close_and_cleanup
+ #define obj_pdp11_bfd_free_cached_info	  _bfd_generic_bfd_free_cached_info
+-#define obj_pdp11_new_section_hook	  _bfd_generic_new_section_hook
+-#define obj_pdp11_set_section_contents	  _bfd_generic_set_section_contents
+ #define obj_pdp11_make_empty_symbol	  _bfd_generic_make_empty_symbol
+ #define obj_pdp11_bfd_is_local_label_name _bfd_nosymbols_bfd_is_local_label_name
+ #define obj_pdp11_bfd_is_target_special_symbol \
+@@ -972,7 +1500,7 @@
+ #define obj_pdp11_find_nearest_line_with_alt \
+   _bfd_nosymbols_find_nearest_line_with_alt
+ #define obj_pdp11_find_line		  _bfd_nosymbols_find_line
+-#define obj_pdp11_set_reloc		  _bfd_norelocs_set_reloc
++#define obj_pdp11_set_reloc		  _bfd_generic_set_reloc
+ #define obj_pdp11_get_lineno		  _bfd_nosymbols_get_lineno
+ #define obj_pdp11_find_inliner_info	  _bfd_nosymbols_find_inliner_info
+ #define obj_pdp11_bfd_make_debug_symbol	  _bfd_nosymbols_bfd_make_debug_symbol
+@@ -981,7 +1509,6 @@
+ #define obj_pdp11_bfd_reloc_type_lookup	  obj_pdp11_reloc_type_lookup
+ #define obj_pdp11_bfd_reloc_name_lookup	  obj_pdp11_reloc_name_lookup
+ #define obj_pdp11_set_arch_mach		  _bfd_generic_set_arch_mach
+-#define obj_pdp11_sizeof_headers	  _bfd_nolink_sizeof_headers
+ #define obj_pdp11_bfd_get_relocated_section_contents \
+   bfd_generic_get_relocated_section_contents
+ #define obj_pdp11_bfd_relax_section	  bfd_generic_relax_section
+@@ -1004,8 +1531,7 @@
+ #define obj_pdp11_bfd_final_link	  _bfd_generic_final_link
+ #define obj_pdp11_bfd_link_split_section  _bfd_generic_link_split_section
+ #define obj_pdp11_bfd_link_check_relocs	  _bfd_generic_link_check_relocs
+-#define obj_pdp11_bfd_copy_private_bfd_data \
+-  _bfd_generic_bfd_copy_private_bfd_data
++#define obj_pdp11_bfd_copy_private_bfd_data obj_pdp11_copy_private_bfd_data
+ #define obj_pdp11_bfd_merge_private_bfd_data \
+   _bfd_generic_bfd_merge_private_bfd_data
+ #define obj_pdp11_bfd_copy_private_section_data \
+@@ -1060,8 +1586,8 @@
+   },
+   {				/* bfd_write_contents.  */
+     _bfd_bool_bfd_false_error,
+-    _bfd_bool_bfd_false_error,	/* No write support yet.  */
+-    _bfd_bool_bfd_false_error,
++    obj_pdp11_write_object_contents,
++    _bfd_bool_bfd_false_error,	/* No archives yet.  */
+     _bfd_bool_bfd_false_error,
+   },
+ 
