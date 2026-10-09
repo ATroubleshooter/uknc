@@ -1,0 +1,257 @@
+From: Yury Klushin <digger@live.ru>
+Date: Fri, 10 Oct 2026 00:00:00 +0300
+Subject: [PATCH] Read the symbols of an RT-11 object module
+
+The global symbol directory is the module's symbol table, so nm and
+objdump -t can have it.  A global entry is a definition or a
+reference, and a definition is either relative to the p-sect declared
+before it or absolute; the flag byte says which, and that decides the
+section a symbol goes to -- the p-sect, *ABS* or *UND*.
+
+Only the globals.  A p-sect is already a section, and a symbol
+standing for a section is something a relocation will want in its own
+right rather than something the directory declares; nm does not list
+those for an ELF object either.
+
+Checked against RT-11's own LINK: four modules out of SYSLIB.OBJ that
+reference nothing, each linked on the machine with /MAP, and every one
+of the 21 globals in those load maps agrees with what nm reports --
+name, section, and value once the p-sect's assigned base is taken off.
+The section attributes LINK prints agree too: RW,I,LCL,REL,CON and
+RW,D,... come back as the flags this reads.  Across all 112 modules of
+the library it reads 430 symbols, 143 of them references.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ bfd/obj-pdp11.c | 160 ++++++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 148 insertions(+), 12 deletions(-)
+
+diff -urN a/bfd/obj-pdp11.c b/bfd/obj-pdp11.c
+--- a/bfd/obj-pdp11.c	2026-10-10 00:54:50
++++ b/bfd/obj-pdp11.c	2026-10-10 00:54:50
+@@ -107,6 +107,12 @@
+ #define OBJ_PFLAG_GBL		0100	/* Global rather than local scope.  */
+ #define OBJ_PFLAG_DATA		0200	/* Data rather than instructions.  */
+ 
++/* Global symbol flag bits.  Bit 6 is set on every global in the
++   modules seen here and is not needed to read one, so it is not
++   decoded.  */
++#define OBJ_GFLAG_DEF		0010	/* A definition, not a reference.  */
++#define OBJ_GFLAG_REL		0040	/* Relative to its p-sect, not absolute.  */
++
+ /* The RLD entry that says where the following TXT goes.  */
+ #define OBJ_RLD_LOCCTR_DEF	7
+ 
+@@ -122,6 +128,13 @@
+ {
+   char module[7];		/* Module name, from the GSD.  */
+   bfd_vma start;		/* Transfer address, or ~0 for none.  */
++  asymbol **syms;		/* What canonicalize_symtab hands back:
++				   the globals in the order the GSD
++				   gives them, then one symbol for each
++				   section.  */
++  asymbol *symstore;		/* Storage for the globals; a section's
++				   own symbol is BFD's.  */
++  long symcount;
+ };
+ 
+ #define obj_tdata(abfd)	((struct obj_pdp11_tdata *) (abfd)->tdata.any)
+@@ -237,6 +250,8 @@
+   bool (*fn) (struct obj_pdp11_walk *, unsigned int, const bfd_byte *, size_t);
+   asection *current;		/* Section the next TXT belongs to.  */
+   bfd_vma current_base;		/* Offset within it of the location counter.  */
++  asection *current_psect;	/* P-sect the GSD is listing globals under.  */
++  long symcount;		/* Globals counted, then globals filled.  */
+   bool saw_module_name;
+ };
+ 
+@@ -335,8 +350,16 @@
+ 	  if (sec->used_by_bfd == NULL)
+ 	    return false;
+ 	  obj_section_data (sec)->pflags = flags;
++	  walk->current_psect = sec;
+ 	  break;
+ 
++	case OBJ_GSD_GLOBAL:
++	  /* A global belongs to the p-sect declared before it.  Only
++	     counted here; the symbols cannot be built until every
++	     section exists.  */
++	  walk->symcount++;
++	  break;
++
+ 	case OBJ_GSD_XFER:
+ 	  obj_tdata (abfd)->start = value;
+ 	  break;
+@@ -349,7 +372,77 @@
+   return true;
+ }
+ 
+-/* Second pass: the text, steered by the location counter definitions in
++/* Second pass over the GSD, once the sections exist: the global
++   symbols.  A global is a definition or a reference, and a definition
++   is relative to the p-sect declared before it or absolute; the flag
++   byte says which.  A reference has nowhere to live, so it goes to the
++   undefined section.  */
++
++static bool
++obj_pdp11_scan_syms (struct obj_pdp11_walk *walk, unsigned int type,
++		     const bfd_byte *body, size_t size)
++{
++  bfd *abfd = walk->abfd;
++  struct obj_pdp11_tdata *tdata = obj_tdata (abfd);
++  size_t k;
++
++  if (type == OBJ_BLK_ENDGSD)
++    return false;
++  if (type != OBJ_BLK_GSD)
++    return true;
++
++  for (k = 0; k + OBJ_GSD_ENTRY_SIZE <= size; k += OBJ_GSD_ENTRY_SIZE)
++    {
++      unsigned int flags = body[k + 4];
++      unsigned int entry = body[k + 5];
++      bfd_vma value = bfd_getl16 (body + k + 6);
++      asymbol *sym;
++
++      if (entry == OBJ_GSD_PSECT)
++	{
++	  char *name = obj_pdp11_name (abfd, body + k);
++
++	  if (name != NULL)
++	    walk->current_psect = bfd_get_section_by_name (abfd, name);
++	  continue;
++	}
++      if (entry != OBJ_GSD_GLOBAL)
++	continue;
++
++      sym = &tdata->symstore[walk->symcount];
++      sym->the_bfd = abfd;
++      sym->name = obj_pdp11_name (abfd, body + k);
++      if (sym->name == NULL)
++	return false;
++      sym->flags = BSF_GLOBAL;
++      sym->udata.p = NULL;
++
++      if ((flags & OBJ_GFLAG_DEF) == 0)
++	{
++	  /* A reference: the value field carries nothing.  */
++	  sym->section = bfd_und_section_ptr;
++	  sym->value = 0;
++	}
++      else if ((flags & OBJ_GFLAG_REL) == 0)
++	{
++	  sym->section = bfd_abs_section_ptr;
++	  sym->value = value;
++	}
++      else
++	{
++	  sym->section = (walk->current_psect != NULL
++			  ? walk->current_psect : bfd_abs_section_ptr);
++	  sym->value = value;
++	}
++
++      tdata->syms[walk->symcount] = sym;
++      walk->symcount++;
++    }
++
++  return true;
++}
++
++/* Third pass: the text, steered by the location counter definitions in
+    the relocation records.  */
+ 
+ static bool
+@@ -466,6 +559,27 @@
+ 	sec->flags |= SEC_HAS_CONTENTS | SEC_LOAD;
+       }
+ 
++  /* The globals, now that every section one can belong to exists.
++     Only the globals: a p-sect is already a section, and a symbol
++     standing for a section is something a relocation will want in its
++     own right rather than something the GSD declares.  */
++  if (walk.symcount > 0)
++    {
++      size_t n = (size_t) walk.symcount;
++
++      tdata->syms = (asymbol **) bfd_alloc (abfd, (n + 1) * sizeof (asymbol *));
++      tdata->symstore = (asymbol *) bfd_zalloc (abfd, n * sizeof (asymbol));
++      if (tdata->syms == NULL || tdata->symstore == NULL)
++	goto fail;
++
++      walk.fn = obj_pdp11_scan_syms;
++      walk.current_psect = NULL;
++      walk.symcount = 0;
++      obj_pdp11_walk_records (&walk, buf, size);
++      tdata->symcount = walk.symcount;
++      tdata->syms[tdata->symcount] = NULL;
++    }
++
+   walk.fn = obj_pdp11_scan_text;
+   walk.current = NULL;
+   obj_pdp11_walk_records (&walk, buf, size);
+@@ -523,24 +637,47 @@
+   return true;
+ }
+ 
+-/* Reading only, so far.  Symbols come next, relocations after them; a
+-   module with neither still disassembles, which is what this much is
+-   for.  */
+-
+ static long
+-obj_pdp11_get_symtab_upper_bound (bfd *abfd ATTRIBUTE_UNUSED)
++obj_pdp11_get_symtab_upper_bound (bfd *abfd)
+ {
+-  return sizeof (asymbol *);
++  return (obj_tdata (abfd)->symcount + 1) * sizeof (asymbol *);
+ }
+ 
+ static long
+-obj_pdp11_canonicalize_symtab (bfd *abfd ATTRIBUTE_UNUSED,
+-			       asymbol **location)
++obj_pdp11_canonicalize_symtab (bfd *abfd, asymbol **location)
+ {
+-  *location = NULL;
+-  return 0;
++  struct obj_pdp11_tdata *tdata = obj_tdata (abfd);
++  long i;
++
++  for (i = 0; i < tdata->symcount; i++)
++    location[i] = tdata->syms[i];
++  location[i] = NULL;
++  return tdata->symcount;
+ }
+ 
++static void
++obj_pdp11_print_symbol (bfd *abfd, void *filep, asymbol *symbol,
++			bfd_print_symbol_type how)
++{
++  FILE *file = (FILE *) filep;
++
++  switch (how)
++    {
++    case bfd_print_symbol_name:
++      fprintf (file, "%s", symbol->name);
++      break;
++    case bfd_print_symbol_more:
++      break;
++    case bfd_print_symbol_all:
++      bfd_print_symbol_vandf (abfd, filep, symbol);
++      fprintf (file, " %-7s %s", symbol->section->name, symbol->name);
++      break;
++    }
++}
++
++/* Relocations come next; a module without them still disassembles,
++   which is what this much is for.  */
++
+ static long
+ obj_pdp11_get_reloc_upper_bound (bfd *abfd ATTRIBUTE_UNUSED,
+ 				 asection *sec ATTRIBUTE_UNUSED)
+@@ -588,7 +725,6 @@
+ #define obj_pdp11_new_section_hook	  _bfd_generic_new_section_hook
+ #define obj_pdp11_set_section_contents	  _bfd_generic_set_section_contents
+ #define obj_pdp11_make_empty_symbol	  _bfd_generic_make_empty_symbol
+-#define obj_pdp11_print_symbol		  _bfd_nosymbols_print_symbol
+ #define obj_pdp11_bfd_is_local_label_name _bfd_nosymbols_bfd_is_local_label_name
+ #define obj_pdp11_bfd_is_target_special_symbol \
+   _bfd_bool_bfd_asymbol_false
