@@ -30,17 +30,20 @@
 
 #define REL_GSD_PSECT 5
 
-#define REL_RLD_INTERNAL 1
-#define REL_RLD_INTERNAL_DISP 3
-#define REL_RLD_LOCCTR_DEF 7
-#define REL_RLD_PSECT 12
-#define REL_RLD_PSECT_DISP 14
-#define REL_RLD_PSECT_ADD 15
-#define REL_RLD_PSECT_ADD_DISP 16
+// RLD entry types, from the manual's Table 2-5, which gives them in
+// octal -- and so does this. For the p-sect forms the same digits read
+// as decimal are a different type, so the distinction matters.
+#define REL_RLD_INTERNAL 001
+#define REL_RLD_INTERNAL_DISP 003
+#define REL_RLD_LOCCTR_DEF 007
+#define REL_RLD_PSECT 012
+#define REL_RLD_PSECT_DISP 014
+#define REL_RLD_PSECT_ADD 015
+#define REL_RLD_PSECT_ADD_DISP 016
 
 enum { PSECT_TEXT, PSECT_DATA, PSECT_BSS, PSECT_ABS, PSECT_COUNT };
 
-// RADIX-50 packings of ".TEXT"/".DATA"/".BSS"/".ABS.", computed offline
+// RADIX-50 packings of ".TEXT"/".DATA"/".BSS"/". ABS.", computed offline
 // (same algorithm as the emitter's own rad50_pack6()) so this reader
 // never needs its own RADIX-50 encoder -- these four names are the
 // only ones it ever has to recognize (no per-symbol names -- see the
@@ -50,7 +53,7 @@ static const unsigned char kPsectNames[PSECT_COUNT][4] = {
     {0x25, 0xb2, 0x20, 0x99},  // .TEXT
     {0xa1, 0xaf, 0x28, 0x7d},  // .DATA
     {0x63, 0xaf, 0xc0, 0x76},  // .BSS
-    {0x2a, 0xaf, 0x20, 0x7b},  // .ABS.
+    {0x01, 0xaf, 0x94, 0x0f},  // . ABS.
 };
 
 // One "formatted binary block" (manual's own term): a byte 1, a byte
@@ -133,7 +136,9 @@ static int parse_gsd(const unsigned char *buf, unsigned int size,
     unsigned int typeword = u16_le(blk.body + i + 4);
     unsigned int value = u16_le(blk.body + i + 6);
 
-    if ((typeword & 0377) == REL_GSD_PSECT) {
+    // The entry carries its flag byte first and its type byte
+    // second, so the type is the high half of the word.
+    if ((typeword >> 8) == REL_GSD_PSECT) {
       cur_psect = find_psect(name4);
       if (cur_psect >= 0 && cur_psect != PSECT_ABS) {
         psect_size[cur_psect] = value;
@@ -165,8 +170,10 @@ static int apply_rld_block(const struct block *blk,
   unsigned int j = 0;
 
   while (j + 2 <= blk->body_len) {
-    unsigned int disp = blk->body[j];
-    unsigned int rtype = blk->body[j + 1];
+    // An RLD entry leads with its command byte; the displacement
+    // byte, into the preceding TXT block, follows it.
+    unsigned int rtype = blk->body[j];
+    unsigned int disp = blk->body[j + 1];
     unsigned int target_base, addend;
     unsigned short patched;
     int p;
@@ -222,15 +229,13 @@ static int apply_rld_block(const struct block *blk,
           j += 2;
         }
         break;
-      // PC-relative, same-module references (see the file header
-      // comment): already correct as written, nothing to patch --
-      // just consume the operand and move on to the next entry.
-      case REL_RLD_INTERNAL_DISP:
-        if (j + 2 > blk->body_len) {
-          return 0;
-        }
-        j += 2;
-        continue;
+      // PC-relative references between p-sects: this loader lays the
+      // p-sects out in the order and spacing the emitter assumed, so
+      // the distance is the same as it was at link time and the word
+      // as written is already right -- just consume the operand and
+      // move on. (A same-p-sect PC-relative reference gets no entry at
+      // all; RT-11's Internal Displaced entry means something this
+      // loader cannot do, so it falls through to the rejection below.)
       case REL_RLD_PSECT_DISP:
       case REL_RLD_PSECT_ADD_DISP:
         if (j + 4 > blk->body_len) {
@@ -250,7 +255,8 @@ static int apply_rld_block(const struct block *blk,
         continue;
       default:
         // REL_RLD_GLOBAL/GLOBAL_ADD (a true external reference, by
-        // name) and every remaining _DISP variant -- unsupported, see
+        // name), REL_RLD_INTERNAL_DISP (an absolute address to measure
+        // a displacement from) and everything else -- unsupported, see
         // the file header comment.
         return 0;
     }

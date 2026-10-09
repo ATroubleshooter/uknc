@@ -59,8 +59,8 @@ reader is done with it.
  ld/Makefile.in                |   2 +
  ld/configure.tgt              |   2 +-
  ld/emulparams/pdp11rt11rel.sh |  23 +
- ld/emultempl/pdp11rt11rel.em  | 859 ++++++++++++++++++++++++++++++++++
- 5 files changed, 886 insertions(+), 1 deletion(-)
+ ld/emultempl/pdp11rt11rel.em  | 877 ++++++++++++++++++++++++++++++++++
+ 5 files changed, 904 insertions(+), 1 deletion(-)
  create mode 100644 ld/emulparams/pdp11rt11rel.sh
  create mode 100644 ld/emultempl/pdp11rt11rel.em
 
@@ -143,7 +143,7 @@ new file mode 100644
 index 0000000..d0f9f4f
 --- /dev/null
 +++ b/ld/emultempl/pdp11rt11rel.em
-@@ -0,0 +1,859 @@
+@@ -0,0 +1,877 @@
 +# This shell script emits a C file. -*- C -*-
 +#   Copyright (C) 2026 Free Software Foundation, Inc.
 +#
@@ -343,20 +343,20 @@ index 0000000..d0f9f4f
 +   what the reference resolves to -- Internal (same p-sect: the addend
 +   in the RLD entry itself *is* the target offset, no separate "plain
 +   vs additive" distinction needed), P-sect (a named p-sect other than
-+   the one currently being written: plain 12/14 if the offset is zero,
-+   additive 15/16 with an explicit constant otherwise), and Global (an
-+   external symbol: plain 2/4 if zero offset, additive 5/6 otherwise).
++   the one currently being written: plain 012/014 if the offset is
++   zero, additive 015/016 with an explicit constant otherwise), and
++   Global (an external symbol: plain 2/4 if zero, additive 5/6).
 +   Since a.out-pdp11 relocations carry their addend as the raw word
 +   already sitting in the section content at that position (there is no
 +   separate stored-addend field -- the same implicit-addend convention
 +   pdp11_aout_link_input_section itself relies on), that raw word is
 +   exactly what decides plain-vs-additive and supplies the constant.
 +
-+   TXT block chunking: an RLD entry's displacement byte is only one
-+   byte (0-255), relative to the *immediately preceding* TXT block's own
-+   load address -- so section content is chunked into REL_TXT_CHUNK
-+   pieces well under that limit, each with its own load address, rather
-+   than emitted as one large blob.  */
++   TXT block chunking: an RLD entry leads with its command byte and
++   then one displacement byte (0-255), relative to the *immediately
++   preceding* TXT block's own load address -- so section content is
++   chunked into REL_TXT_CHUNK pieces well under that limit, each with
++   its own load address, rather than emitted as one large blob.  */
 +
 +#include "bfdlink.h"
 +#include <ctype.h>
@@ -380,22 +380,26 @@ index 0000000..d0f9f4f
 +#define REL_GFLAG_REL	0x20	/* Bit 5: 1 = relative value.  */
 +
 +/* GSD P-sect Name flag bits (manual, Table 2-4).  */
++#define REL_PFLAG_OVR	0x04	/* Bit 2: 1 = overlaid, 0 = concatenated.  */
 +#define REL_PFLAG_REL	0x20	/* Bit 5: 1 = relocatable p-sect.  */
 +#define REL_PFLAG_GBL	0x40	/* Bit 6: 1 = global scope.  */
 +#define REL_PFLAG_DATA	0x80	/* Bit 7: 1 = data (D), 0 = instruction (I).  */
 +
-+/* RLD entry types (manual, Table 2-5).  */
-+#define REL_RLD_INTERNAL	1
-+#define REL_RLD_GLOBAL		2
-+#define REL_RLD_INTERNAL_DISP	3
-+#define REL_RLD_GLOBAL_DISP	4
-+#define REL_RLD_GLOBAL_ADD	5
-+#define REL_RLD_GLOBAL_ADD_DISP	6
-+#define REL_RLD_LOCCTR_DEF	7
-+#define REL_RLD_PSECT		12
-+#define REL_RLD_PSECT_DISP	14
-+#define REL_RLD_PSECT_ADD	15
-+#define REL_RLD_PSECT_ADD_DISP	16
++/* RLD entry types, from the manual's Table 2-5, which gives them in
++   octal -- and so does this.  For the p-sect forms the same digits
++   read as decimal are a different type that LINK also accepts, so
++   nothing complains; the module just means something else.  */
++#define REL_RLD_INTERNAL	001
++#define REL_RLD_GLOBAL		002
++#define REL_RLD_INTERNAL_DISP	003
++#define REL_RLD_GLOBAL_DISP	004
++#define REL_RLD_GLOBAL_ADD	005
++#define REL_RLD_GLOBAL_ADD_DISP	006
++#define REL_RLD_LOCCTR_DEF	007
++#define REL_RLD_PSECT		012
++#define REL_RLD_PSECT_DISP	014
++#define REL_RLD_PSECT_ADD	015
++#define REL_RLD_PSECT_ADD_DISP	016
 +
 +/* ---- RADIX-50 ---- */
 +
@@ -642,13 +646,13 @@ index 0000000..d0f9f4f
 +  relbuf_word (&b, REL_BLK_GSD);
 +
 +  relbuf_name (&b, modname);
-+  relbuf_word (&b, REL_GSD_MODNAME);
++  relbuf_word (&b, REL_GSD_MODNAME << 8);
 +  relbuf_word (&b, 0);
 +
 +  for (i = 0; i < 3; i++)
 +    {
 +      relbuf_name (&b, psects[i].name);
-+      relbuf_word (&b, (unsigned int) (REL_GSD_PSECT | (psects[i].flags << 8)));
++      relbuf_word (&b, (unsigned int) (psects[i].flags | (REL_GSD_PSECT << 8)));
 +      relbuf_word (&b, (unsigned int) psects[i].sec->size);
 +
 +      for (s = 0; s < symcount; s++)
@@ -662,16 +666,19 @@ index 0000000..d0f9f4f
 +
 +	  relbuf_name (&b, bfd_asymbol_name (sym));
 +	  relbuf_word (&b, (unsigned int)
-+			    (REL_GSD_GLOBAL
-+			     | ((REL_GFLAG_DEF | REL_GFLAG_REL) << 8)));
++			    (REL_GFLAG_DEF | REL_GFLAG_REL
++			     | (REL_GSD_GLOBAL << 8)));
 +	  relbuf_word (&b, (unsigned int) sym->value);
 +	}
 +    }
 +
-+  /* .ABS.: declare it (size 0, absolute -- REL_PFLAG_REL left clear),
-+     then every undefined global reference under it, per the manual.  */
-+  relbuf_name (&b, ".ABS.");
-+  relbuf_word (&b, (unsigned int) (REL_GSD_PSECT | (REL_PFLAG_GBL << 8)));
++  /* ". ABS.": declare it the way MACRO-11 does -- size 0, absolute
++     (REL_PFLAG_REL left clear) and overlaid, or LINK reports
++     conflicting section attributes -- then every undefined global
++     reference under it, per the manual.  */
++  relbuf_name (&b, ". ABS.");
++  relbuf_word (&b, (unsigned int) (REL_PFLAG_GBL | REL_PFLAG_OVR
++				   | (REL_GSD_PSECT << 8)));
 +  relbuf_word (&b, 0);
 +
 +  for (s = 0; s < symcount; s++)
@@ -684,7 +691,7 @@ index 0000000..d0f9f4f
 +	continue;
 +
 +      relbuf_name (&b, bfd_asymbol_name (sym));
-+      relbuf_word (&b, (unsigned int) (REL_GSD_GLOBAL | (0 << 8)));
++      relbuf_word (&b, (unsigned int) (0 | (REL_GSD_GLOBAL << 8)));
 +      relbuf_word (&b, 0);
 +    }
 +
@@ -718,8 +725,8 @@ index 0000000..d0f9f4f
 +     displacement byte is unused (always 0).  */
 +  relbuf_init (&b);
 +  relbuf_word (&b, REL_BLK_RLD);
-+  relbuf_byte (&b, 0);
 +  relbuf_byte (&b, REL_RLD_LOCCTR_DEF);
++  relbuf_byte (&b, 0);
 +  relbuf_name (&b, psect->name);
 +  relbuf_word (&b, 0);
 +  ok = relbuf_flush (f, &b);
@@ -795,26 +802,37 @@ index 0000000..d0f9f4f
 +
 +	      if (constant == 0)
 +		{
-+		  relbuf_byte (&b, disp);
 +		  relbuf_byte (&b, pcrel ? REL_RLD_GLOBAL_DISP : REL_RLD_GLOBAL);
++		  relbuf_byte (&b, disp);
 +		  relbuf_name (&b, name);
 +		}
 +	      else
 +		{
-+		  relbuf_byte (&b, disp);
 +		  relbuf_byte (&b, pcrel
 +				    ? REL_RLD_GLOBAL_ADD_DISP : REL_RLD_GLOBAL_ADD);
++		  relbuf_byte (&b, disp);
 +		  relbuf_name (&b, name);
 +		  relbuf_word (&b, constant);
 +		}
 +	    }
 +	  else if (kind == (enum rel_psect_kind) (psect - psects))
 +	    {
-+	      /* Same p-sect as the one we're currently writing.  */
-+	      relbuf_byte (&b, disp);
-+	      relbuf_byte (&b, pcrel
-+				? REL_RLD_INTERNAL_DISP : REL_RLD_INTERNAL);
-+	      relbuf_word (&b, constant);
++	      /* Same p-sect as the one we're currently writing.  A
++		 PC-relative reference to it gets no entry at all: the
++		 distance between two places in one p-sect does not
++		 change when the p-sect is placed, so the word as
++		 written is already final.  RT-11's own Internal
++		 Displaced entry means something else -- that the word
++		 holds the absolute address to measure from -- so
++		 emitting one here makes LINK read a displacement as an
++		 address and refuse the whole module with
++		 "?LINK-F-Storing text beyond high limit".  */
++	      if (!pcrel)
++		{
++		  relbuf_byte (&b, REL_RLD_INTERNAL);
++		  relbuf_byte (&b, disp);
++		  relbuf_word (&b, constant);
++		}
 +	    }
 +	  else
 +	    {
@@ -822,19 +840,19 @@ index 0000000..d0f9f4f
 +		 which has no rel_psect_info entry of its own -- use its
 +		 fixed name directly).  */
 +	      const char *pname
-+		= (kind == PSECT_ABS) ? ".ABS." : psects[(int) kind].name;
++		= (kind == PSECT_ABS) ? ". ABS." : psects[(int) kind].name;
 +
 +	      if (constant == 0)
 +		{
-+		  relbuf_byte (&b, disp);
 +		  relbuf_byte (&b, pcrel ? REL_RLD_PSECT_DISP : REL_RLD_PSECT);
++		  relbuf_byte (&b, disp);
 +		  relbuf_name (&b, pname);
 +		}
 +	      else
 +		{
-+		  relbuf_byte (&b, disp);
 +		  relbuf_byte (&b, pcrel
 +				    ? REL_RLD_PSECT_ADD_DISP : REL_RLD_PSECT_ADD);
++		  relbuf_byte (&b, disp);
 +		  relbuf_name (&b, pname);
 +		  relbuf_word (&b, constant);
 +		}

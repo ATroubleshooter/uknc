@@ -257,9 +257,9 @@ index a17233ddc11..016c0ed1012 100644
     RADIX-50: 6-character, uppercase-only symbol names (space=0, A-Z=1-
     26, $=27, .=28, 0-9=36-45; two characters -- 29,30,31,35 -- unused),
 @@ -200,11 +81,11 @@ fragment <<EOF
-    the one currently being written: plain 12/14 if the offset is zero,
-    additive 15/16 with an explicit constant otherwise), and Global (an
-    external symbol: plain 2/4 if zero offset, additive 5/6 otherwise).
+    the one currently being written: plain 012/014 if the offset is
+    zero, additive 015/016 with an explicit constant otherwise), and
+    Global (an external symbol: plain 2/4 if zero, additive 5/6).
 -   Since a.out-pdp11 relocations carry their addend as the raw word
 -   already sitting in the section content at that position (there is no
 -   separate stored-addend field -- the same implicit-addend convention
@@ -271,8 +271,8 @@ index a17233ddc11..016c0ed1012 100644
 +   relocations keep their addend in a field of their own and leave the
 +   content empty.
  
-    TXT block chunking: an RLD entry's displacement byte is only one
-    byte (0-255), relative to the *immediately preceding* TXT block's own
+    TXT block chunking: an RLD entry leads with its command byte and
+    then one displacement byte (0-255), relative to the *immediately
 @@ -448,32 +329,95 @@ struct rel_psect_info
    const char *name;
    asection *sec;	/* NULL for .ABS.  */
