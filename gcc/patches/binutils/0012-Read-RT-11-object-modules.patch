@@ -1,0 +1,862 @@
+From: Yury Klushin <digger@live.ru>
+Date: Thu, 9 Oct 2026 00:00:00 +0300
+Subject: [PATCH] Read RT-11 object modules
+
+What MACRO-11 writes and what LINK and LIBR read.  We already write the
+format, from the linker side, in ld/emultempl/pdp11rt11rel.em; nothing
+could read it back, so there was no way to check what we emit against
+what DEC's own tools emit, and no way to link against a module or a
+library that came from the machine -- SYSLIB.OBJ included.
+
+This is the reading half's skeleton: format recognition, records and
+their checksums, p-sects becoming sections, and section contents
+assembled out of the TXT records.  Symbols and relocations are not
+translated yet, so a module reads as sections with contents and
+nothing else; that is already enough for objdump -h, -s and -d.
+
+Which section a TXT record belongs to is not in the TXT record: the
+RLD record before it carries a location counter definition naming a
+p-sect and an offset, and that is what the TXT address is relative to.
+So the relocation records have to be walked even though the
+relocations themselves are not read, which in turn needs the entry
+size of every RLD type.  Those sizes come from the manual, and were
+checked against every RLD record in a real SYSLIB.OBJ: 166 records,
+all consumed exactly, no bytes left over.
+
+Note for when the writer is revisited: the p-sect relocation types in
+that library are 13 and 14, which under our writer's numbering
+(ld/emultempl/pdp11rt11rel.em, and the loader in libs/libppu) do not
+mean a p-sect relocation at all.  Our modules therefore read back
+correctly only through our own loader.  The table here follows the
+real data.
+
+Checked by reading all 112 modules of SYSLIB.OBJ: every section's
+contents came back byte for byte identical to an independent
+reconstruction, no TXT record fell outside its p-sect, and a .SAV, a
+library and a C source file are all still correctly not recognised.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ bfd/Makefile.am        |   4 +-
+ bfd/Makefile.in        |   7 +-
+ bfd/config.bfd         |   4 +-
+ bfd/obj-pdp11.c        | 702 +++++++++++++++++++++++++++++++++++++++++
+ bfd/po/SRC-POTFILES.in |   1 +
+ bfd/targets.c          |   7 +
+ 6 files changed, 719 insertions(+), 6 deletions(-)
+ create mode 100644 bfd/obj-pdp11.c
+
+diff -urN a/bfd/Makefile.am b/bfd/Makefile.am
+--- a/bfd/Makefile.am	2026-10-09 23:53:12
++++ b/bfd/Makefile.am	2026-10-09 23:53:12
+@@ -79,7 +79,7 @@
+ 	coff-bfd.lo compress.lo corefile.lo elf-properties.lo format.lo \
+ 	hash.lo libbfd.lo linker.lo merge.lo opncls.lo reloc.lo \
+ 	section.lo simple.lo stab-syms.lo stabs.lo syms.lo targets.lo \
+-	binary.lo ihex.lo srec.lo tekhex.lo verilog.lo sav-pdp11.lo
++	binary.lo ihex.lo srec.lo tekhex.lo verilog.lo sav-pdp11.lo obj-pdp11.lo
+ 
+ BFD64_LIBS = archive64.lo
+ 
+@@ -88,7 +88,7 @@
+ 	compress.c corefile.c elf-properties.c format.c hash.c \
+ 	libbfd.c linker.c merge.c opncls.c reloc.c \
+ 	section.c simple.c stab-syms.c stabs.c syms.c targets.c \
+-	binary.c ihex.c srec.c tekhex.c verilog.c sav-pdp11.c
++	binary.c ihex.c srec.c tekhex.c verilog.c sav-pdp11.c obj-pdp11.c
+ 
+ BFD64_LIBS_CFILES = archive64.c
+ 
+diff -urN a/bfd/Makefile.in b/bfd/Makefile.in
+--- a/bfd/Makefile.in	2026-10-09 23:53:12
++++ b/bfd/Makefile.in	2026-10-09 23:53:12
+@@ -183,7 +183,7 @@
+ 	format.lo hash.lo libbfd.lo linker.lo merge.lo opncls.lo \
+ 	reloc.lo section.lo simple.lo stab-syms.lo stabs.lo syms.lo \
+ 	targets.lo binary.lo ihex.lo srec.lo tekhex.lo verilog.lo \
+-	sav-pdp11.lo
++	sav-pdp11.lo obj-pdp11.lo
+ am_libbfd_la_OBJECTS = $(am__objects_1)
+ libbfd_la_OBJECTS = $(am_libbfd_la_OBJECTS)
+ AM_V_lt = $(am__v_lt_@AM_V@)
+@@ -546,7 +546,7 @@
+ 	coff-bfd.lo compress.lo corefile.lo elf-properties.lo format.lo \
+ 	hash.lo libbfd.lo linker.lo merge.lo opncls.lo reloc.lo \
+ 	section.lo simple.lo stab-syms.lo stabs.lo syms.lo targets.lo \
+-	binary.lo ihex.lo srec.lo tekhex.lo verilog.lo sav-pdp11.lo
++	binary.lo ihex.lo srec.lo tekhex.lo verilog.lo sav-pdp11.lo obj-pdp11.lo
+ 
+ BFD64_LIBS = archive64.lo
+ BFD32_LIBS_CFILES = \
+@@ -554,7 +554,7 @@
+ 	compress.c corefile.c elf-properties.c format.c hash.c \
+ 	libbfd.c linker.c merge.c opncls.c reloc.c \
+ 	section.c simple.c stab-syms.c stabs.c syms.c targets.c \
+-	binary.c ihex.c srec.c tekhex.c verilog.c sav-pdp11.c
++	binary.c ihex.c srec.c tekhex.c verilog.c sav-pdp11.c obj-pdp11.c
+ 
+ BFD64_LIBS_CFILES = archive64.c
+ 
+@@ -1724,6 +1724,7 @@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/reloc.Plo@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/reloc16.Plo@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/rs6000-core.Plo@am__quote@
++@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/obj-pdp11.Plo@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/sav-pdp11.Plo@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/section.Plo@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/simple.Plo@am__quote@
+diff -urN a/bfd/config.bfd b/bfd/config.bfd
+--- a/bfd/config.bfd	2026-10-09 23:53:12
++++ b/bfd/config.bfd	2026-10-09 23:53:12
+@@ -1086,7 +1086,9 @@
+     # Makes the sav-pdp11 (RT-11 SAV executable) target vector visible
+     # in bfd/targets.c -- see the #ifdef guard there.  Only meaningful
+     # for the rt11 OS: aout builds stay identical to vanilla binutils.
+-    targ_cflags=-DBFD_SUPPORTS_SAV_PDP11
++    # Likewise for obj-pdp11, the RT-11 relocatable object format that
++    # MACRO-11, LINK and LIBR speak.
++    targ_cflags="-DBFD_SUPPORTS_SAV_PDP11 -DBFD_SUPPORTS_OBJ_PDP11"
+     ;;
+ 
+   pdp11-*-*)
+diff -urN a/bfd/obj-pdp11.c b/bfd/obj-pdp11.c
+--- a/bfd/obj-pdp11.c	1970-01-01 03:00:00
++++ b/bfd/obj-pdp11.c	2026-10-09 23:53:12
+@@ -0,0 +1,702 @@
++/* BFD back-end for RT-11 relocatable object modules (PDP-11).
++   Copyright (C) 2026 Free Software Foundation, Inc.
++
++   This file is part of BFD, the Binary File Descriptor library.
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation; either version 3 of the License, or
++   (at your option) any later version.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program; if not, write to the Free Software
++   Foundation, Inc., 51 Franklin Street - Fifth Floor, Boston,
++   MA 02110-1301, USA.  */
++
++/* An RT-11 object module -- what MACRO-11 writes and what LINK and LIBR
++   read -- in the format DEC's own manuals call "formatted binary".  This
++   back-end reads one.  Writing is done elsewhere for now, by the
++   pdp11rt11rel linker emulation; the intent is that it moves here.
++
++   The file is a stream of records.  Each begins with the bytes 1 and 0,
++   then a 16-bit length covering those two bytes, the length itself, the
++   record type word and the payload; a one-byte checksum follows, chosen
++   so that the record's bytes plus the checksum sum to zero modulo 256.
++   Records may be separated by null padding, which a reader skips.
++
++   The record types used by a module are:
++
++     GSD (1)     global symbol directory: names the module, its program
++		 sections and its global symbols
++     ENDGSD (2)  end of the directory
++     TXT (3)     a load address and the bytes to put there
++     RLD (4)     what in the preceding TXT has to be relocated, and how
++     ENDMOD (6)  end of the module
++
++   A library adds LIBHDR (7) and LIBEND (8) around a run of modules;
++   those are not read here yet.
++
++   Names are RADIX-50: three characters to a 16-bit word, from the
++   alphabet " ABCDEFGHIJKLMNOPQRSTUVWXYZ$.0123456789", so six characters
++   to a pair of words and no lower case.
++
++   A GSD entry is eight bytes: four of name, one of flags, one of entry
++   type, two of value.  The types this reads are module name (0), global
++   symbol (4), program section (5) and transfer address (3).
++
++   Program sections are what BFD calls sections.  Their flags say
++   relocatable or absolute (040), global or local (0100), data or
++   instruction (0200), and overlaid or concatenated (04) -- the last
++   having no counterpart in BFD, so it is kept only to be written back
++   out again.
++
++   Which section a TXT record belongs to is not in the TXT record.  The
++   RLD record before it carries a location counter definition (type 7),
++   naming a section and an offset within it, and that is what the
++   following TXT address is relative to.  So reading the contents means
++   reading the relocation records too, even though the relocations
++   themselves are not translated yet.
++
++   The entry sizes of the other RLD types are needed in order to step
++   over them.  They were taken from the manual and then checked against
++   every RLD record in a real SYSLIB.OBJ -- 166 of them, all consumed
++   exactly, with types 1, 2, 4, 7, 8, 13 and 14 occurring.  */
++
++#include "sysdep.h"
++#include "bfd.h"
++#include "libbfd.h"
++#include "libiberty.h"
++
++/* Record framing.  */
++#define OBJ_REC_MARK1		1
++#define OBJ_REC_MARK2		0
++#define OBJ_REC_HEADER		6	/* Marks, length and type.  */
++#define OBJ_REC_MIN		OBJ_REC_HEADER
++
++/* Record types.  */
++#define OBJ_BLK_GSD		1
++#define OBJ_BLK_ENDGSD		2
++#define OBJ_BLK_TXT		3
++#define OBJ_BLK_RLD		4
++#define OBJ_BLK_ISD		5
++#define OBJ_BLK_ENDMOD		6
++#define OBJ_BLK_LIBHDR		7
++#define OBJ_BLK_LIBEND		8
++
++/* GSD entry types.  */
++#define OBJ_GSD_MODNAME		0
++#define OBJ_GSD_CSECT		1
++#define OBJ_GSD_ISN		2
++#define OBJ_GSD_XFER		3
++#define OBJ_GSD_GLOBAL		4
++#define OBJ_GSD_PSECT		5
++#define OBJ_GSD_IDENT		6
++#define OBJ_GSD_VSECT		7
++#define OBJ_GSD_ENTRY_SIZE	8
++
++/* P-sect flag bits.  */
++#define OBJ_PFLAG_OVR		0004	/* Overlaid rather than concatenated.  */
++#define OBJ_PFLAG_REL		0040	/* Relocatable rather than absolute.  */
++#define OBJ_PFLAG_GBL		0100	/* Global rather than local scope.  */
++#define OBJ_PFLAG_DATA		0200	/* Data rather than instructions.  */
++
++/* The RLD entry that says where the following TXT goes.  */
++#define OBJ_RLD_LOCCTR_DEF	7
++
++/* The name RT-11 gives the absolute section, and the one this gives the
++   section whose own name is six spaces.  */
++#define OBJ_ABS_NAME		". ABS."
++#define OBJ_BLANK_NAME		". BLANK."
++
++/* A PDP-11 address space is 64K, so no module is bigger.  */
++#define OBJ_MAX_SIZE		65536
++
++struct obj_pdp11_tdata
++{
++  char module[7];		/* Module name, from the GSD.  */
++  bfd_vma start;		/* Transfer address, or ~0 for none.  */
++};
++
++#define obj_tdata(abfd)	((struct obj_pdp11_tdata *) (abfd)->tdata.any)
++
++/* Per-section data.  The contents live in a buffer of our own, since a
++   section is assembled from TXT records that arrive in no particular
++   order; the p-sect flags are kept because BFD has no room for the
++   overlay bit and writing the module back out will want them.  */
++
++struct obj_pdp11_section_data
++{
++  unsigned int pflags;		/* The p-sect flag byte, verbatim.  */
++  bfd_byte *contents;
++};
++
++#define obj_section_data(sec) \
++  ((struct obj_pdp11_section_data *) (sec)->used_by_bfd)
++
++/* How many bytes of argument an RLD entry of type CMD carries, after
++   the command and displacement bytes.  -1 for a type this does not
++   know, which ends the walk.  */
++
++static int
++obj_pdp11_rld_arg_size (unsigned int cmd)
++{
++  switch (cmd)
++    {
++    case 1:  return 2;		/* Internal.  */
++    case 2:  return 4;		/* Global.  */
++    case 3:  return 2;		/* Internal displaced.  */
++    case 4:  return 4;		/* Global displaced.  */
++    case 5:  return 6;		/* Global additive.  */
++    case 6:  return 6;		/* Global additive displaced.  */
++    case 7:  return 6;		/* Location counter definition.  */
++    case 8:  return 2;		/* Location counter modification.  */
++    case 9:  return 0;		/* Program limits.  */
++    case 10: return 4;		/* P-sect.  */
++    case 12: return 4;		/* P-sect displaced.  */
++    case 13: return 6;		/* P-sect additive.  */
++    case 14: return 6;		/* P-sect additive displaced.  */
++    case 16: return 2;		/* Resident library.  */
++    default: return -1;
++    }
++}
++
++/* bfd_alloc + strcpy, which libbfd has no spelling for.  */
++
++static char *
++obj_pdp11_strdup (bfd *abfd, const char *s)
++{
++  size_t n = strlen (s) + 1;
++  char *p = (char *) bfd_alloc (abfd, n);
++
++  if (p != NULL)
++    memcpy (p, s, n);
++  return p;
++}
++
++/* Unpack one RADIX-50 word into three characters at OUT.  */
++
++static void
++obj_pdp11_unrad50 (unsigned int word, char *out)
++{
++  static const char alphabet[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ$.0123456789";
++  unsigned int divisor = 1600;
++  int i;
++
++  for (i = 0; i < 3; i++)
++    {
++      unsigned int digit = (word / divisor) % 40;
++
++      out[i] = digit < sizeof (alphabet) - 1 ? alphabet[digit] : '?';
++      divisor /= 40;
++    }
++}
++
++/* The six-character name a GSD entry or RLD argument carries at P, as a
++   string in memory owned by ABFD.  Trailing blanks go; a name that is
++   all blanks becomes the blank section's name.  */
++
++static char *
++obj_pdp11_name (bfd *abfd, const bfd_byte *p)
++{
++  char raw[7];
++  size_t len;
++  char *name;
++
++  obj_pdp11_unrad50 (bfd_getl16 (p), raw);
++  obj_pdp11_unrad50 (bfd_getl16 (p + 2), raw + 3);
++  raw[6] = '\0';
++
++  for (len = 6; len > 0 && raw[len - 1] == ' '; len--)
++    ;
++  if (len == 0)
++    return obj_pdp11_strdup (abfd, OBJ_BLANK_NAME);
++
++  raw[len] = '\0';
++  name = (char *) bfd_alloc (abfd, len + 1);
++  if (name != NULL)
++    memcpy (name, raw, len + 1);
++  return name;
++}
++
++/* Walk the records of the module held in BUF.  Calls FN for each one
++   with its type and payload; FN returns false to stop.  Returns false
++   if the stream is malformed.  */
++
++struct obj_pdp11_walk
++{
++  bfd *abfd;
++  bool (*fn) (struct obj_pdp11_walk *, unsigned int, const bfd_byte *, size_t);
++  asection *current;		/* Section the next TXT belongs to.  */
++  bfd_vma current_base;		/* Offset within it of the location counter.  */
++  bool saw_module_name;
++};
++
++static bool
++obj_pdp11_walk_records (struct obj_pdp11_walk *walk, const bfd_byte *buf,
++			size_t size)
++{
++  size_t i = 0;
++  bool any = false;
++
++  while (i + OBJ_REC_MIN <= size)
++    {
++      size_t length, sum, k;
++      unsigned int type;
++
++      /* Records are padded apart with nulls.  */
++      if (buf[i] != OBJ_REC_MARK1 || buf[i + 1] != OBJ_REC_MARK2)
++	{
++	  i++;
++	  continue;
++	}
++
++      length = bfd_getl16 (buf + i + 2);
++      if (length < OBJ_REC_MIN || i + length >= size)
++	return any;
++
++      for (sum = 0, k = i; k < i + length; k++)
++	sum += buf[k];
++      if (((0u - sum) & 0xff) != buf[i + length])
++	return any;
++
++      type = bfd_getl16 (buf + i + 4);
++      if (!walk->fn (walk, type, buf + i + OBJ_REC_HEADER,
++		     length - OBJ_REC_HEADER))
++	return true;
++
++      any = true;
++      i += length + 1;
++    }
++
++  return any;
++}
++
++/* First pass: the global symbol directory, which is where the sections
++   come from.  */
++
++static bool
++obj_pdp11_scan_gsd (struct obj_pdp11_walk *walk, unsigned int type,
++		    const bfd_byte *body, size_t size)
++{
++  bfd *abfd = walk->abfd;
++  size_t k;
++
++  if (type == OBJ_BLK_ENDGSD)
++    return false;
++  if (type != OBJ_BLK_GSD)
++    return true;
++
++  for (k = 0; k + OBJ_GSD_ENTRY_SIZE <= size; k += OBJ_GSD_ENTRY_SIZE)
++    {
++      unsigned int flags = body[k + 4];
++      unsigned int entry = body[k + 5];
++      bfd_vma value = bfd_getl16 (body + k + 6);
++      char *name;
++      asection *sec;
++      flagword secflags;
++
++      switch (entry)
++	{
++	case OBJ_GSD_MODNAME:
++	  name = obj_pdp11_name (abfd, body + k);
++	  if (name == NULL)
++	    return false;
++	  strncpy (obj_tdata (abfd)->module, name,
++		   sizeof (obj_tdata (abfd)->module) - 1);
++	  walk->saw_module_name = true;
++	  break;
++
++	case OBJ_GSD_PSECT:
++	  name = obj_pdp11_name (abfd, body + k);
++	  if (name == NULL)
++	    return false;
++
++	  secflags = SEC_ALLOC;
++	  if ((flags & OBJ_PFLAG_DATA) != 0)
++	    secflags |= SEC_DATA;
++	  else
++	    secflags |= SEC_CODE;
++
++	  sec = bfd_make_section_anyway_with_flags (abfd, name, secflags);
++	  if (sec == NULL)
++	    return false;
++	  sec->size = value;
++	  sec->alignment_power = 1;
++	  sec->used_by_bfd = bfd_zalloc (abfd, sizeof (*obj_section_data (sec)));
++	  if (sec->used_by_bfd == NULL)
++	    return false;
++	  obj_section_data (sec)->pflags = flags;
++	  break;
++
++	case OBJ_GSD_XFER:
++	  obj_tdata (abfd)->start = value;
++	  break;
++
++	default:
++	  break;
++	}
++    }
++
++  return true;
++}
++
++/* Second pass: the text, steered by the location counter definitions in
++   the relocation records.  */
++
++static bool
++obj_pdp11_scan_text (struct obj_pdp11_walk *walk, unsigned int type,
++		     const bfd_byte *body, size_t size)
++{
++  bfd *abfd = walk->abfd;
++
++  if (type == OBJ_BLK_ENDMOD)
++    return false;
++
++  if (type == OBJ_BLK_RLD)
++    {
++      size_t k = 0;
++
++      while (k + 2 <= size)
++	{
++	  unsigned int cmd = body[k] & 0x7f;
++	  int arg = obj_pdp11_rld_arg_size (cmd);
++
++	  if (arg < 0 || k + 2 + (size_t) arg > size)
++	    break;
++
++	  if (cmd == OBJ_RLD_LOCCTR_DEF)
++	    {
++	      char *name = obj_pdp11_name (abfd, body + k + 2);
++
++	      if (name != NULL)
++		{
++		  walk->current = bfd_get_section_by_name (abfd, name);
++		  walk->current_base = bfd_getl16 (body + k + 6);
++		}
++	    }
++
++	  k += 2 + (size_t) arg;
++	}
++
++      return true;
++    }
++
++  if (type == OBJ_BLK_TXT && size >= 2 && walk->current != NULL)
++    {
++      bfd_vma where = bfd_getl16 (body);
++      struct obj_pdp11_section_data *data = obj_section_data (walk->current);
++      bfd_byte *contents = data != NULL ? data->contents : NULL;
++      size_t n = size - 2;
++
++      /* The address is the location counter, which the definition above
++	 set relative to the section's own start.  */
++      if (where >= walk->current_base)
++	where -= walk->current_base;
++      else
++	where = 0;
++
++      if (contents != NULL && where + n <= walk->current->size)
++	memcpy (contents + where, body + 2, n);
++    }
++
++  return true;
++}
++
++/* Does ABFD hold an RT-11 object module?  */
++
++static bfd_cleanup
++obj_pdp11_object_p (bfd *abfd)
++{
++  struct obj_pdp11_walk walk;
++  struct obj_pdp11_tdata *tdata;
++  bfd_byte *buf;
++  size_t size;
++  asection *sec;
++  ufile_ptr filesize;
++
++  filesize = bfd_get_file_size (abfd);
++  if (filesize == 0 || filesize > OBJ_MAX_SIZE)
++    {
++      bfd_set_error (bfd_error_wrong_format);
++      return NULL;
++    }
++  size = (size_t) filesize;
++
++  if (bfd_seek (abfd, 0, SEEK_SET) != 0)
++    return NULL;
++  buf = (bfd_byte *) _bfd_malloc_and_read (abfd, size, size);
++  if (buf == NULL)
++    return NULL;
++
++  /* The first record has to be a directory that names the module.  A
++     library starts with its own header instead, which is not read
++     here.  */
++  tdata = (struct obj_pdp11_tdata *) bfd_zalloc (abfd, sizeof (*tdata));
++  if (tdata == NULL)
++    goto fail;
++  tdata->start = (bfd_vma) -1;
++  abfd->tdata.any = tdata;
++
++  memset (&walk, 0, sizeof (walk));
++  walk.abfd = abfd;
++  walk.fn = obj_pdp11_scan_gsd;
++  if (!obj_pdp11_walk_records (&walk, buf, size) || !walk.saw_module_name)
++    {
++      bfd_set_error (bfd_error_wrong_format);
++      goto fail;
++    }
++
++  /* Room for what the TXT records are about to say.  */
++  for (sec = abfd->sections; sec != NULL; sec = sec->next)
++    if (sec->size != 0 && obj_section_data (sec) != NULL)
++      {
++	obj_section_data (sec)->contents
++	  = (bfd_byte *) bfd_zalloc (abfd, sec->size);
++	if (obj_section_data (sec)->contents == NULL)
++	  goto fail;
++	sec->flags |= SEC_HAS_CONTENTS | SEC_LOAD;
++      }
++
++  walk.fn = obj_pdp11_scan_text;
++  walk.current = NULL;
++  obj_pdp11_walk_records (&walk, buf, size);
++
++  free (buf);
++
++  abfd->flags |= HAS_SYMS | HAS_RELOC;
++  if (tdata->start != (bfd_vma) -1)
++    {
++      abfd->start_address = tdata->start;
++      abfd->flags |= EXEC_P;
++    }
++  if (!bfd_default_set_arch_mach (abfd, bfd_arch_pdp11, 0))
++    goto fail;
++
++  return _bfd_no_cleanup;
++
++ fail:
++  free (buf);
++  return NULL;
++}
++
++/* Hand back what the TXT records put in the section.  */
++
++static bool
++obj_pdp11_get_section_contents (bfd *abfd ATTRIBUTE_UNUSED, asection *section,
++				void *location, file_ptr offset,
++				bfd_size_type count)
++{
++  struct obj_pdp11_section_data *data = obj_section_data (section);
++  bfd_byte *contents = data != NULL ? data->contents : NULL;
++
++  if (contents == NULL
++      || (bfd_vma) offset > section->size
++      || count > section->size - offset)
++    {
++      bfd_set_error (bfd_error_invalid_operation);
++      return false;
++    }
++
++  memcpy (location, contents + offset, count);
++  return true;
++}
++
++static bool
++obj_pdp11_mkobject (bfd *abfd)
++{
++  struct obj_pdp11_tdata *tdata
++    = (struct obj_pdp11_tdata *) bfd_zalloc (abfd, sizeof (*tdata));
++
++  if (tdata == NULL)
++    return false;
++  tdata->start = (bfd_vma) -1;
++  abfd->tdata.any = tdata;
++  return true;
++}
++
++/* Reading only, so far.  Symbols come next, relocations after them; a
++   module with neither still disassembles, which is what this much is
++   for.  */
++
++static long
++obj_pdp11_get_symtab_upper_bound (bfd *abfd ATTRIBUTE_UNUSED)
++{
++  return sizeof (asymbol *);
++}
++
++static long
++obj_pdp11_canonicalize_symtab (bfd *abfd ATTRIBUTE_UNUSED,
++			       asymbol **location)
++{
++  *location = NULL;
++  return 0;
++}
++
++static long
++obj_pdp11_get_reloc_upper_bound (bfd *abfd ATTRIBUTE_UNUSED,
++				 asection *sec ATTRIBUTE_UNUSED)
++{
++  return sizeof (arelent *);
++}
++
++static long
++obj_pdp11_canonicalize_reloc (bfd *abfd ATTRIBUTE_UNUSED,
++			      asection *sec ATTRIBUTE_UNUSED,
++			      arelent **relptr,
++			      asymbol **symbols ATTRIBUTE_UNUSED)
++{
++  *relptr = NULL;
++  return 0;
++}
++
++static void
++obj_pdp11_get_symbol_info (bfd *abfd ATTRIBUTE_UNUSED,
++			   asymbol *symbol, symbol_info *ret)
++{
++  bfd_symbol_info (symbol, ret);
++}
++
++static bool
++obj_pdp11_find_nearest_line (bfd *abfd ATTRIBUTE_UNUSED,
++			     asymbol **symbols ATTRIBUTE_UNUSED,
++			     asection *section ATTRIBUTE_UNUSED,
++			     bfd_vma offset ATTRIBUTE_UNUSED,
++			     const char **filename_ptr,
++			     const char **functionname_ptr,
++			     unsigned int *line_ptr,
++			     unsigned int *discriminator_ptr)
++{
++  *filename_ptr = NULL;
++  *functionname_ptr = NULL;
++  *line_ptr = 0;
++  if (discriminator_ptr != NULL)
++    *discriminator_ptr = 0;
++  return false;
++}
++
++#define obj_pdp11_close_and_cleanup	  _bfd_generic_close_and_cleanup
++#define obj_pdp11_bfd_free_cached_info	  _bfd_generic_bfd_free_cached_info
++#define obj_pdp11_new_section_hook	  _bfd_generic_new_section_hook
++#define obj_pdp11_set_section_contents	  _bfd_generic_set_section_contents
++#define obj_pdp11_make_empty_symbol	  _bfd_generic_make_empty_symbol
++#define obj_pdp11_print_symbol		  _bfd_nosymbols_print_symbol
++#define obj_pdp11_bfd_is_local_label_name _bfd_nosymbols_bfd_is_local_label_name
++#define obj_pdp11_bfd_is_target_special_symbol \
++  _bfd_bool_bfd_asymbol_false
++#define obj_pdp11_get_symbol_version_string \
++  _bfd_nosymbols_get_symbol_version_string
++#define obj_pdp11_find_nearest_line_with_alt \
++  _bfd_nosymbols_find_nearest_line_with_alt
++#define obj_pdp11_find_line		  _bfd_nosymbols_find_line
++#define obj_pdp11_set_reloc		  _bfd_norelocs_set_reloc
++#define obj_pdp11_get_lineno		  _bfd_nosymbols_get_lineno
++#define obj_pdp11_find_inliner_info	  _bfd_nosymbols_find_inliner_info
++#define obj_pdp11_bfd_make_debug_symbol	  _bfd_nosymbols_bfd_make_debug_symbol
++#define obj_pdp11_read_minisymbols	  _bfd_generic_read_minisymbols
++#define obj_pdp11_minisymbol_to_symbol	  _bfd_generic_minisymbol_to_symbol
++#define obj_pdp11_bfd_reloc_type_lookup	  _bfd_norelocs_bfd_reloc_type_lookup
++#define obj_pdp11_bfd_reloc_name_lookup	  _bfd_norelocs_bfd_reloc_name_lookup
++#define obj_pdp11_set_arch_mach		  _bfd_generic_set_arch_mach
++#define obj_pdp11_sizeof_headers	  _bfd_nolink_sizeof_headers
++#define obj_pdp11_bfd_get_relocated_section_contents \
++  bfd_generic_get_relocated_section_contents
++#define obj_pdp11_bfd_relax_section	  bfd_generic_relax_section
++#define obj_pdp11_bfd_gc_sections	  bfd_generic_gc_sections
++#define obj_pdp11_bfd_lookup_section_flags bfd_generic_lookup_section_flags
++#define obj_pdp11_bfd_merge_sections	  bfd_generic_merge_sections
++#define obj_pdp11_bfd_is_group_section	  bfd_generic_is_group_section
++#define obj_pdp11_bfd_group_name	  bfd_generic_group_name
++#define obj_pdp11_bfd_discard_group	  bfd_generic_discard_group
++#define obj_pdp11_section_already_linked  _bfd_generic_section_already_linked
++#define obj_pdp11_bfd_define_common_symbol bfd_generic_define_common_symbol
++#define obj_pdp11_bfd_link_hide_symbol	  _bfd_generic_link_hide_symbol
++#define obj_pdp11_bfd_define_start_stop	  bfd_generic_define_start_stop
++#define obj_pdp11_bfd_link_hash_table_create \
++  _bfd_generic_link_hash_table_create
++#define obj_pdp11_bfd_link_add_symbols	  _bfd_generic_link_add_symbols
++#define obj_pdp11_bfd_link_just_syms	  _bfd_generic_link_just_syms
++#define obj_pdp11_bfd_copy_link_hash_symbol_type \
++  _bfd_generic_copy_link_hash_symbol_type
++#define obj_pdp11_bfd_final_link	  _bfd_generic_final_link
++#define obj_pdp11_bfd_link_split_section  _bfd_generic_link_split_section
++#define obj_pdp11_bfd_link_check_relocs	  _bfd_generic_link_check_relocs
++#define obj_pdp11_bfd_copy_private_bfd_data \
++  _bfd_generic_bfd_copy_private_bfd_data
++#define obj_pdp11_bfd_merge_private_bfd_data \
++  _bfd_generic_bfd_merge_private_bfd_data
++#define obj_pdp11_bfd_copy_private_section_data \
++  _bfd_generic_bfd_copy_private_section_data
++#define obj_pdp11_bfd_copy_private_symbol_data \
++  _bfd_generic_bfd_copy_private_symbol_data
++#define obj_pdp11_bfd_copy_private_header_data \
++  _bfd_generic_bfd_copy_private_header_data
++#define obj_pdp11_bfd_set_private_flags	  _bfd_generic_bfd_set_private_flags
++#define obj_pdp11_bfd_print_private_bfd_data \
++  _bfd_generic_bfd_print_private_bfd_data
++#define obj_pdp11_core_file_failing_command _bfd_nocore_core_file_failing_command
++#define obj_pdp11_core_file_failing_signal _bfd_nocore_core_file_failing_signal
++#define obj_pdp11_core_file_matches_executable_p \
++  _bfd_nocore_core_file_matches_executable_p
++#define obj_pdp11_core_file_pid		  _bfd_nocore_core_file_pid
++#define obj_pdp11_init_private_section_data \
++  _bfd_generic_init_private_section_data
++
++const bfd_target obj_pdp11_vec =
++{
++  "obj-pdp11",			/* Name.  */
++  bfd_target_unknown_flavour,
++  BFD_ENDIAN_LITTLE,		/* Target byte order.  */
++  BFD_ENDIAN_LITTLE,		/* Target headers byte order.  */
++  HAS_RELOC | HAS_SYMS,		/* Object flags.  */
++  (SEC_CODE | SEC_DATA | SEC_HAS_CONTENTS
++   | SEC_ALLOC | SEC_LOAD | SEC_RELOC), /* Section flags.  */
++  0,				/* Leading underscore.  */
++  ' ',				/* AR_pad_char.  */
++  16,				/* AR_max_namelen.  */
++  0,				/* Match priority.  */
++  TARGET_KEEP_UNUSED_SECTION_SYMBOLS, /* Keep unused section symbols.  */
++  bfd_getl64, bfd_getl_signed_64, bfd_putl64,
++  bfd_getl32, bfd_getl_signed_32, bfd_putl32,
++  bfd_getl16, bfd_getl_signed_16, bfd_putl16,	/* Data.  */
++  bfd_getl64, bfd_getl_signed_64, bfd_putl64,
++  bfd_getl32, bfd_getl_signed_32, bfd_putl32,
++  bfd_getl16, bfd_getl_signed_16, bfd_putl16,	/* Hdrs.  */
++
++  {				/* bfd_check_format.  */
++    _bfd_dummy_target,
++    obj_pdp11_object_p,
++    _bfd_dummy_target,		/* No archives yet.  */
++    _bfd_dummy_target,
++  },
++  {				/* bfd_set_format.  */
++    _bfd_bool_bfd_false_error,
++    obj_pdp11_mkobject,
++    _bfd_bool_bfd_false_error,
++    _bfd_bool_bfd_false_error,
++  },
++  {				/* bfd_write_contents.  */
++    _bfd_bool_bfd_false_error,
++    _bfd_bool_bfd_false_error,	/* No write support yet.  */
++    _bfd_bool_bfd_false_error,
++    _bfd_bool_bfd_false_error,
++  },
++
++  BFD_JUMP_TABLE_GENERIC (obj_pdp11),
++  BFD_JUMP_TABLE_COPY (obj_pdp11),
++  BFD_JUMP_TABLE_CORE (obj_pdp11),
++  BFD_JUMP_TABLE_ARCHIVE (_bfd_noarchive),
++  BFD_JUMP_TABLE_SYMBOLS (obj_pdp11),
++  BFD_JUMP_TABLE_RELOCS (obj_pdp11),
++  BFD_JUMP_TABLE_WRITE (obj_pdp11),
++  BFD_JUMP_TABLE_LINK (obj_pdp11),
++  BFD_JUMP_TABLE_DYNAMIC (_bfd_nodynamic),
++
++  NULL,
++
++  NULL
++};
+diff -urN a/bfd/po/SRC-POTFILES.in b/bfd/po/SRC-POTFILES.in
+--- a/bfd/po/SRC-POTFILES.in	2026-10-09 23:53:12
++++ b/bfd/po/SRC-POTFILES.in	2026-10-09 23:53:12
+@@ -337,6 +337,7 @@
+ reloc.c
+ reloc16.c
+ rs6000-core.c
++obj-pdp11.c
+ sav-pdp11.c
+ section.c
+ simple.c
+diff -urN a/bfd/targets.c b/bfd/targets.c
+--- a/bfd/targets.c	2026-10-09 23:53:12
++++ b/bfd/targets.c	2026-10-09 23:53:12
+@@ -957,6 +957,9 @@
+ #ifdef BFD_SUPPORTS_SAV_PDP11
+ extern const bfd_target sav_pdp11_vec;
+ #endif
++#ifdef BFD_SUPPORTS_OBJ_PDP11
++extern const bfd_target obj_pdp11_vec;
++#endif
+ 
+ /* All of the xvecs for core files.  */
+ extern const bfd_target core_cisco_be_vec;
+@@ -1391,6 +1394,10 @@
+ #ifdef BFD_SUPPORTS_SAV_PDP11
+ /* Likewise for RT-11 SAV executables.  */
+ 	&sav_pdp11_vec,
++#endif
++#ifdef BFD_SUPPORTS_OBJ_PDP11
++/* Likewise for RT-11 relocatable object modules.  */
++	&obj_pdp11_vec,
+ #endif
+ 
+ #if BFD_SUPPORTS_PLUGINS
