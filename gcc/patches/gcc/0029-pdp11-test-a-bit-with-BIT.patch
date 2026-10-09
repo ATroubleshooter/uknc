@@ -1,5 +1,5 @@
 From: Yury Klushin <digger@live.ru>
-Date: Thu, 8 Oct 2026 22:55:34 +0300
+Date: Fri, 9 Oct 2026 21:06:42 +0300
 Subject: [PATCH] pdp11: test a bit with BIT
 
 BIT computes src & dst for the condition codes and writes nothing
@@ -34,13 +34,13 @@ instructions and no BIC between them.  The examples here build byte
 for byte as before -- none of them tests a bit this way -- and the
 rest of the pdp11 tests still pass.
 ---
- gcc/config/pdp11/pdp11.md                 | 92 +++++++++++++++++++++++
- gcc/testsuite/gcc.target/pdp11/bit-test.c | 44 +++++++++++
- 2 files changed, 136 insertions(+)
+ gcc/config/pdp11/pdp11.md                 | 73 +++++++++++++++++++++++
+ gcc/testsuite/gcc.target/pdp11/bit-test.c | 44 ++++++++++++++
+ 2 files changed, 117 insertions(+)
  create mode 100644 gcc/testsuite/gcc.target/pdp11/bit-test.c
 
 diff --git a/gcc/config/pdp11/pdp11.md b/gcc/config/pdp11/pdp11.md
-index 8e20b1e..97c6e37 100644
+index 5cfdc84..97c6e37 100644
 --- a/gcc/config/pdp11/pdp11.md
 +++ b/gcc/config/pdp11/pdp11.md
 @@ -263,6 +263,24 @@
@@ -68,7 +68,7 @@ index 8e20b1e..97c6e37 100644
  ;; Two word compare
  (define_insn "cmpsi"
    [(set (reg:CC CC_REGNUM)
-@@ -493,6 +511,80 @@
+@@ -493,6 +511,61 @@
  		      (pc)))]
    "")
  
@@ -127,28 +127,9 @@ index 8e20b1e..97c6e37 100644
 +		      (pc)))]
 +  "operands[4] = GEN_INT ((HOST_WIDE_INT) 1 << INTVAL (operands[2]));")
 +
-+(define_insn_and_split "cbranch<mode>4"
-+  [(set (pc)
-+	(if_then_else (match_operator 0 "ordered_comparison_operator"
-+		       [(match_operand:QHSDint 1 "cmp_operand" "g")
-+			(match_operand:QHSDint 2 "cmp_operand" "g")])
-+		      (label_ref (match_operand 3 "" ""))
-+		      (pc)))]
-+  ""
-+  "#"
-+  "reload_completed"
-+  [(set (reg:CC CC_REGNUM)
-+	(compare:CC (match_dup 1) (match_dup 2)))
-+   (set (pc)
-+	(if_then_else (match_op_dup 0
-+                      [(reg:CC CC_REGNUM) (const_int 0)])
-+		      (label_ref (match_dup 3))
-+		      (pc)))]
-+  "")
-+
- ;; This splitter turns a branch on float condition into a branch on
- ;; CPU condition, by adding a CFCC.
- (define_split
+ (define_insn_and_split "cbranch<mode>4"
+   [(set (pc)
+ 	(if_then_else (match_operator 0 "ordered_comparison_operator"
 diff --git a/gcc/testsuite/gcc.target/pdp11/bit-test.c b/gcc/testsuite/gcc.target/pdp11/bit-test.c
 new file mode 100644
 index 0000000..790df95
