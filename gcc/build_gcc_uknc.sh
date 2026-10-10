@@ -4,10 +4,10 @@ set -e
 # Builds the pdp11-uknc-rt11 cross toolchain: binutils, gcc and newlib
 # from their vanilla releases, with this project's own patches applied
 # from patches/ beside this script -- one directory per component, one
-# file per commit.  They live there and nowhere else: a build needs
-# GitHub for the release tarballs alone, what is applied is what the
-# repository says it is, and a change to a patch is a change with a diff
-# like any other.
+# file per commit.  They live there and nowhere else: a build needs the
+# network for the sources alone, what is applied is what the repository
+# says it is, and a change to a patch is a change with a diff like any
+# other.
 #
 # The first thirty-odd came from the forks
 #
@@ -32,6 +32,7 @@ set -e
 BINUTILS_VERSION="2.45"
 GCC_VERSION="15.2.0"
 NEWLIB_VERSION="4.6.0.20260123"
+MACRO11_VERSION="0.9"
 
 BUILDDIR="${PWD}"
 # Where this script is, which is where its patches are.  Not the same as
@@ -285,6 +286,32 @@ git clone https://github.com/nzeemin/ukncbtl-utils.git
 cd ${BUILDDIR}/src/ukncbtl-utils/rt11dsk
 make
 cp rt11dsk ${BUILDDIR}/bin/rt11dsk
+
+# Download, patch and build macro11
+#
+# A MACRO-11 assembler that runs here rather than on the machine, so
+# that a .MAC source becomes an RT-11 object module without a trip
+# through the emulator.  Rhialto's fork of Krehbiel's assembler, at its
+# 0.9 release: of the forks about, this is the one whose output is byte
+# for byte what RT-11's own MACRO V05.06R writes -- checked by
+# assembling the same source both ways -- and the one with a regression
+# suite of its own.
+#
+# Built with RT-11 as the default object format, because it is the only
+# one this toolchain has a use for; the assembler's own default is RSX,
+# and -rsx still asks for that.  What comes out is read by ld
+# (obj-pdp11, see bfd/obj-pdp11.c), so a module assembled here links
+# with ELF objects like any other input.
+#
+# Not prefixed pdp11-uknc-rt11-, for the same reason rt11dsk above is
+# not: it is a program of its own rather than one of a cross toolchain's
+# matched set.
+cd ${BUILDDIR}/src
+git clone --depth 1 --single-branch --branch macro11-v${MACRO11_VERSION} https://gitlab.com/Rhialto/macro11.git
+cd ${BUILDDIR}/src/macro11
+apply_patches macro11
+make OBJFORMAT=-DDEFAULT_OBJECTFORMAT_RT11=1
+cp macro11 ${BUILDDIR}/bin/macro11
 
 # Build and install libppu (../libs/libppu): libppu.a, its headers
 # (ppu_client.h/ppu_server.h) and ppu.ld go into the sysroot beside
