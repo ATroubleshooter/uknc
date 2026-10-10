@@ -23,6 +23,64 @@
 слинкованный с тем, что оказалось на раннере, на другой машине скорее обуза.
 Там сборка — это проверка, а не продукт.
 
+#### Что нужно на машине
+
+Из сети сборка тянет только исходники: binutils, gcc и newlib — тарболлами с
+ftp.gnu.org и sourceware.org, gdb, rt11dsk и macro11 — клонами. Всё остальное
+уже должно стоять:
+
+- **Компилятор хоста (C и C++), `make`, `sh`, `git`, `curl`, `tar`, `patch`,
+  `diff`, `perl`, `m4`.** Последние два нужны не напрямую: скрипт собирает себе
+  autoconf 2.69 и automake 1.15.1 — ровно те, которыми собран newlib, потому
+  что более новый automake меняет префиксы имён объектных файлов и ломает
+  newlib'овский список `MATHOBJS_IN_LIBC`, — и ими перегенерирует его
+  `configure`.
+- **GMP, MPFR, MPC с заголовками.** Арифметика gcc, и ими же gdb считает
+  адреса. Для gcc они не обязательны — не найдя заголовков, он скачает и
+  соберёт свои (`contrib/download_prerequisites`), — а вот gdb без них не
+  соберётся.
+- **zlib с заголовками.** `--with-system-zlib` у binutils и gcc. Эмулятору она
+  нужна отдельно: PNG-скриншоты `monitor screenshot` жмутся ею.
+- **bison и flex.** gdb здесь собирается из клона, а не из релиза, поэтому его
+  парсеры генерируются на месте. На macOS нужны свежие, из Homebrew: родной
+  bison 2006 года их не берёт — workflow поэтому и ставит его каталог в `PATH`
+  первым.
+- **pkg-config и SDL3 — нужны только окну эмулятора.** Без них сборка проходит,
+  эмулятор остаётся без экрана (см. `util/Screen.cpp`), а машину всё равно
+  видно через gdb и `monitor screenshot`.
+
+Ровно то же командами — как их выполняет workflow:
+
+```bash
+# Debian/Ubuntu
+sudo apt-get install -y --no-install-recommends \
+  build-essential texinfo bison flex libtool \
+  libgmp-dev libmpfr-dev libmpc-dev zlib1g-dev
+# экран эмулятора, необязательно
+sudo apt-get install -y libsdl3-dev
+```
+
+```bash
+# macOS
+xcode-select --install
+brew install gmp mpfr libmpc bison flex sdl3
+export PATH="$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
+```
+
+```bash
+# Windows: MSYS2, оболочка UCRT64
+pacman -S --needed git make patch curl tar diffutils texinfo bison flex perl \
+  autoconf automake libtool mingw-w64-ucrt-x86_64-toolchain \
+  mingw-w64-ucrt-x86_64-gmp mingw-w64-ucrt-x86_64-mpfr \
+  mingw-w64-ucrt-x86_64-mpc mingw-w64-ucrt-x86_64-zlib \
+  mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-sdl3
+```
+
+Два пакета в этих строках лишние, и стоят там на всякий случай: `texinfo`
+(скрипт везде передаёт `MAKEINFO=true`, документация не собирается вовсе) и
+`libtool` (ни один `configure` здесь его не вызывает, а newlib давно обходится
+без libtool-макросов) — на macOS они и не ставятся.
+
 Не по каждому пушу: час с лишним на платформу, так что запуск руками из вкладки
 Actions (можно попросить одну платформу) или по тегу. Каждая сборка перед
 упаковкой собирает `examples/hello`, гоняет его на машине и проверяет, что он
