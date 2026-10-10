@@ -1,0 +1,375 @@
+From: Yury Klushin <digger@live.ru>
+Date: Fri, 10 Oct 2026 19:30:00 +0300
+Subject: [PATCH] Let ld set the SAV image's stack address
+
+RT-11's own linker can be told where a program's stack goes: LINK's /M
+option takes either the address itself or the name of a global symbol
+whose address to use, and writes it into word 042 of the image's header
+block.  This gives ld the same option under the name --stack=, for the
+one emulation that writes a SAV image.
+
+The default stays RT-11's own, 01000, which is the right answer for a
+program whose crt0 asks the monitor for the real top of memory and
+moves SP there.  A program that does not do that -- a bare .S with no
+crt0, something that has to keep its stack somewhere specific -- had no
+way to say so short of patching the header afterwards.
+
+A numeric argument is read the way ld reads numbers everywhere else, so
+01000 is octal and 0x200 is the same address in hex; anything that is
+not a number is taken as a symbol name.  The symbol is looked up in the
+executable this emulation has just linked rather than in the linker's
+own hash table, because by the time the SAV conversion runs the link is
+over and the output bfd has been closed -- the file on disk is what is
+left.  An odd address is refused (the PDP-11 traps on a word push
+through an odd SP, and /M refuses one too), as is one outside the 64K
+address space, and the resolved address is reported in octal, which is
+the one thing the user cannot work out for themselves when the argument
+was a symbol.
+
+The address reaches the writer through bfd_sav_pdp11_set_stack_address,
+declared in the new bfd/sav-pdp11.h: ld already includes bfd's own
+headers this way, and a backend-private header keeps the declaration
+next to the definition instead of in generated bfd.h.
+
+Verified: --stack=0100000 puts 0100000 in word 042 and the program
+still runs; --stack=_end resolves to the symbol's address; --stack=0x2000
+reads as 020000; 01001, nosuchsym and 0x12000 are each refused with the
+reason.  Without the option every image is byte-for-byte what it was.
+---
+ bfd/Makefile.am              |   2 +-
+ bfd/Makefile.in              |   2 +-
+ bfd/po/SRC-POTFILES.in       |   1 +
+ bfd/sav-pdp11.c              |  60 ++++++++++++++++++++++++------
+ bfd/sav-pdp11.h              |  35 +++++++++++++++++
+ ld/emultempl/pdp11rt11sav.em | 105 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ ld/ldlex.h                   |   2 +
+ 7 files changed, 193 insertions(+), 14 deletions(-)
+
+diff -urN a/bfd/Makefile.am b/bfd/Makefile.am
+--- a/bfd/Makefile.am	2026-10-10 19:30:00
++++ b/bfd/Makefile.am	2026-10-10 19:30:00
+@@ -720,7 +720,7 @@
+ 	mach-o.h \
+ 	netbsd.h ns32k.h \
+ 	pef.h pef-traceback.h peicode.h plugin.h \
+-	som.h sysdep.h \
++	sav-pdp11.h som.h sysdep.h \
+ 	version.h vms.h \
+ 	wasm-module.h \
+ 	xcofflink.h xsym.h
+diff -urN a/bfd/Makefile.in b/bfd/Makefile.in
+--- a/bfd/Makefile.in	2026-10-10 19:30:00
++++ b/bfd/Makefile.in	2026-10-10 19:30:00
+@@ -1184,7 +1184,7 @@
+ 	mach-o.h \
+ 	netbsd.h ns32k.h \
+ 	pef.h pef-traceback.h peicode.h plugin.h \
+-	som.h sysdep.h \
++	sav-pdp11.h som.h sysdep.h \
+ 	version.h vms.h \
+ 	wasm-module.h \
+ 	xcofflink.h xsym.h
+diff -urN a/bfd/po/SRC-POTFILES.in b/bfd/po/SRC-POTFILES.in
+--- a/bfd/po/SRC-POTFILES.in	2026-10-10 19:30:00
++++ b/bfd/po/SRC-POTFILES.in	2026-10-10 19:30:00
+@@ -339,6 +339,7 @@
+ rs6000-core.c
+ obj-pdp11.c
+ sav-pdp11.c
++sav-pdp11.h
+ section.c
+ simple.c
+ som.c
+diff -urN a/bfd/sav-pdp11.c b/bfd/sav-pdp11.c
+--- a/bfd/sav-pdp11.c	2026-10-10 19:30:00
++++ b/bfd/sav-pdp11.c	2026-10-10 19:30:00
+@@ -40,7 +40,9 @@
+        entry address.  RT-11 copies this word into low memory at address
+        042 before transferring control, so a program's startup code can
+        read it back via `mov @$042,sp` instead of hardcoding a stack
+-       address of its own.  See SAV_DEFAULT_STACK_ADDRESS below.
++       address of its own.  Defaults to SAV_DEFAULT_STACK_ADDRESS below;
++       ld's --stack= overrides it through
++       bfd_sav_pdp11_set_stack_address().
+      - word index 024 (octal), byte offset 050: the program's "high
+        limit", that is the highest memory address it uses -- which
+        includes .bss, and so is *not* the length of the file.
+@@ -62,7 +64,12 @@
+ #include "sysdep.h"
+ #include "bfd.h"
+ #include "libbfd.h"
++#include "sav-pdp11.h"
+ 
++/* Defined at the bottom of this file; bfd_sav_pdp11_set_stack_address()
++   checks against it.  */
++extern const bfd_target sav_pdp11_vec;
++
+ /* A PDP-11 address space is 64K.  */
+ #define SAV_IMAGE_SIZE		65536
+ 
+@@ -74,22 +81,22 @@
+    program content starts at 01000 (decimal 512).  */
+ #define SAV_LOAD_ADDRESS	  512
+ 
+-/* Initial SP: RT-11's own default for a .SAV image, the one LINK stores
+-   when its /M option is not used.  The stack grows down from the
+-   program's load address through the free low memory between the top of
+-   the system communication area (which ends at 0476) and 01000, which
+-   is exactly what every RT-11 program built by LINK does unless it asks
+-   for something else.
++/* Default initial SP: RT-11's own default for a .SAV image, the one
++   LINK stores when its /M option is not used.  The stack grows down
++   from the program's load address through the free low memory between
++   the top of the system communication area (which ends at 0476) and
++   01000, which is exactly what every RT-11 program built by LINK does
++   unless it asks for something else.
+ 
+    Keeping the stack *below* the program is what makes this safe
+    regardless of how large the program is: crt0's very first EMT
+    (.SETTOP, which asks the monitor for the real top of memory and
+    raises SP to it) pushes PC/PS through this SP before crt0 gets to
+-   replace it, and a value somewhere above the program would put that
++   replace it, and a default somewhere above the program would put that
+    push inside the program's own already-loaded text once the program
+-   grew past it.  (That is not hypothetical: this backend used to write
+-   a fixed 16896 here, and a program linked to ~20KB had its code
+-   silently corrupted by that first push.)  */
++   grew past it.  (That is not hypothetical: an earlier version of this
++   backend defaulted to a fixed 16896, and a program linked to ~20KB
++   had its code silently corrupted by that first push.)  */
+ #define SAV_DEFAULT_STACK_ADDRESS	01000
+ 
+ /* Byte offset of the block-usage bitmap within the header.  */
+@@ -125,6 +132,7 @@
+   bfd_byte *image;
+   bfd_vma base;
+   bool have_base;
++  bfd_vma stack;
+ };
+ 
+ static bool
+@@ -138,7 +146,32 @@
+   tdata->image = (bfd_byte *) bfd_zalloc (abfd, SAV_IMAGE_SIZE);
+   if (tdata->image == NULL)
+     return false;
++  tdata->stack = SAV_DEFAULT_STACK_ADDRESS;
+   abfd->tdata.any = (void *) tdata;
++  return true;
++}
++
++/* Override the default initial SP; see sav-pdp11.h.  */
++
++bool
++bfd_sav_pdp11_set_stack_address (bfd *abfd, bfd_vma addr)
++{
++  struct sav_pdp11_data *tdata;
++
++  if (abfd->xvec != &sav_pdp11_vec || abfd->tdata.any == NULL)
++    {
++      bfd_set_error (bfd_error_invalid_operation);
++      return false;
++    }
++
++  if ((addr & 1) != 0 || addr > SAV_IMAGE_SIZE)
++    {
++      bfd_set_error (bfd_error_bad_value);
++      return false;
++    }
++
++  tdata = (struct sav_pdp11_data *) abfd->tdata.any;
++  tdata->stack = addr;
+   return true;
+ }
+ 
+@@ -306,7 +339,10 @@
+   if (start == 0)
+     start = SAV_LOAD_ADDRESS;
+ 
+-  sp = SAV_DEFAULT_STACK_ADDRESS;
++  /* SAV_DEFAULT_STACK_ADDRESS unless ld's --stack= said otherwise; a
++     caller that asks for a particular address gets it, exactly as
++     LINK's /M overrides LINK's own default.  */
++  sp = tdata->stack;
+ 
+   /* The high limit is the highest memory address the program uses, not
+      the length of the file: .bss occupies real memory that no byte of
+diff -urN a/bfd/sav-pdp11.h b/bfd/sav-pdp11.h
+--- a/bfd/sav-pdp11.h	2026-10-10 19:30:00
++++ b/bfd/sav-pdp11.h	2026-10-10 19:30:00
+@@ -0,0 +1,35 @@
++/* BFD back-end for RT-11 SAV executables (PDP-11): the parts ld needs.
++   Copyright (C) 2026 Free Software Foundation, Inc.
++
++   This file is part of BFD, the Binary File Descriptor library.
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation; either version 3 of the License, or
++   (at your option) any later version.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program; if not, write to the Free Software
++   Foundation, Inc., 51 Franklin Street - Fifth Floor, Boston,
++   MA 02110-1301, USA.  */
++
++#ifndef SAV_PDP11_H
++#define SAV_PDP11_H
++
++/* Set the initial stack pointer written to word 021 (byte offset 042)
++   of the image's header block, overriding the RT-11 default.  ABFD must
++   be a sav-pdp11 object open for writing whose format has been set, so
++   that its tdata exists; ADDR must be even, since the PDP-11 traps on a
++   word push through an odd SP.  Returns false, with the BFD error set,
++   if either does not hold.
++
++   This is ld's side of --stack=; see emultempl/pdp11rt11sav.em.  */
++
++extern bool bfd_sav_pdp11_set_stack_address (bfd *abfd, bfd_vma addr);
++
++#endif /* SAV_PDP11_H */
+diff -urN a/ld/emultempl/pdp11rt11sav.em b/ld/emultempl/pdp11rt11sav.em
+--- a/ld/emultempl/pdp11rt11sav.em	2026-10-10 19:30:00
++++ b/ld/emultempl/pdp11rt11sav.em	2026-10-10 19:30:00
+@@ -29,8 +29,90 @@
+ 
+ /* --- \begin{pdp11rt11sav.em} */
+ #include "libiberty.h"
++#include "sav-pdp11.h"
+ #include <errno.h>
+ 
++/* --stack=, RT-11 LINK's /M option by another name: the initial stack
++   pointer that goes into word 021 (byte offset 042) of the SAV image's
++   header block, in place of the RT-11 default of 01000.  Like /M it
++   takes either the address itself or the name of a global symbol whose
++   address to use.  Unlike /M, whose argument is always octal, a numeric
++   argument follows the C conventions ld uses everywhere else, so the
++   RT-11 default would be written 01000 in octal, 0x200 in hex or 512 in
++   decimal.  NULL until the option is seen.  */
++static const char *rt11_stack = NULL;
++
++/* Resolve --stack='s argument against IBFD, the executable this
++   emulation has just linked and is about to repack as a SAV image.  A
++   symbol is looked up in that file rather than in the linker's own hash
++   table because by the time this runs the link is over and the output
++   bfd has been closed; the file on disk is what is left.  */
++
++static bfd_vma
++gld${EMULATION_NAME}_stack_address (bfd *ibfd)
++{
++  bfd_vma addr;
++  char *end;
++  char octal[16];
++  long storage, count, i;
++  asymbol **syms;
++  bool found;
++
++  addr = (bfd_vma) strtoul (rt11_stack, &end, 0);
++  found = end != rt11_stack && *end == '\0';
++
++  if (!found)
++    {
++      /* Not a number, so a symbol name.  */
++      storage = bfd_get_symtab_upper_bound (ibfd);
++      if (storage < 0)
++	fatal (_("%P: %s: cannot read the symbol table: %E\n"),
++	       bfd_get_filename (ibfd));
++      if (storage == 0)
++	fatal (_("%P: --stack=%s: the linked output has no symbol table "
++		 "to look the symbol up in (--strip-all?)\n"), rt11_stack);
++
++      syms = (asymbol **) xmalloc (storage);
++      count = bfd_canonicalize_symtab (ibfd, syms);
++      if (count < 0)
++	fatal (_("%P: %s: cannot read the symbol table: %E\n"),
++	       bfd_get_filename (ibfd));
++
++      for (i = 0; i < count; i++)
++	if (strcmp (bfd_asymbol_name (syms[i]), rt11_stack) == 0
++	    && !bfd_is_und_section (bfd_asymbol_section (syms[i])))
++	  {
++	    addr = bfd_asymbol_value (syms[i]);
++	    found = true;
++	    break;
++	  }
++
++      free (syms);
++
++      if (!found)
++	fatal (_("%P: --stack=%s: no such number, and no such defined "
++		 "symbol either\n"), rt11_stack);
++    }
++
++  /* Addresses in this format are written in octal, and ld's own
++     diagnostics cannot print octal, so spell the resolved address out
++     here -- it is the one thing the user cannot see for themselves when
++     the argument was a symbol name.  */
++  sprintf (octal, "0%lo", (unsigned long) addr);
++
++  /* The PDP-11 traps on a word push through an odd SP, so a stack that
++     starts on one is never what the caller meant -- LINK's /M rejects
++     an odd address too.  */
++  if ((addr & 1) != 0)
++    fatal (_("%P: --stack=%s: the stack address %s is odd\n"),
++	   rt11_stack, octal);
++  if (addr > 0xfffe)
++    fatal (_("%P: --stack=%s: the stack address %s is outside the 64K "
++	     "PDP-11 address space\n"), rt11_stack, octal);
++
++  return addr;
++}
++
+ /* This emulation's OUTPUT_FORMAT is the ordinary object format, the same
+    as plain pdp11rt11, and not "sav-pdp11" -- deliberately.  That backend
+    has a real relocation-resolution path; the generic BFD final-link path
+@@ -84,6 +166,12 @@
+   bfd_set_arch_mach (obfd, bfd_get_arch (ibfd), bfd_get_mach (ibfd));
+   bfd_set_start_address (obfd, bfd_get_start_address (ibfd));
+ 
++  if (rt11_stack != NULL
++      && !bfd_sav_pdp11_set_stack_address
++	    (obfd, gld${EMULATION_NAME}_stack_address (ibfd)))
++    fatal (_("%P: %s: cannot set the RT-11 SAV stack address: %E\n"),
++	   tmp_filename);
++
+   /* Two passes: bfd_set_section_contents() below marks the output bfd's
+      output_has_begun once the first byte is written, and every
+      bfd_make_section_*() call refuses to run after that point.  So every
+@@ -157,4 +245,21 @@
+ 
+ EOF
+ 
++PARSE_AND_LIST_LONGOPTS=${PARSE_AND_LIST_LONGOPTS}'
++  { "stack", required_argument, NULL, OPTION_RT11_STACK },
++'
++
++PARSE_AND_LIST_OPTIONS=${PARSE_AND_LIST_OPTIONS}'
++  fprintf (file, _("\
++  --stack=<address|symbol>    Set the initial stack pointer of the RT-11\n\
++                                SAV image, the way RT-11 LINK /M does;\n\
++                                the default is 01000\n"));
++'
++
++PARSE_AND_LIST_ARGS_CASES=${PARSE_AND_LIST_ARGS_CASES}'
++    case OPTION_RT11_STACK:
++      rt11_stack = optarg;
++      break;
++'
++
+ LDEMUL_AFTER_CLOSE_OUTPUT=gld"$EMULATION_NAME"_after_close_output
+diff -urN a/ld/ldlex.h b/ld/ldlex.h
+--- a/ld/ldlex.h	2026-10-10 19:30:00
++++ b/ld/ldlex.h	2026-10-10 19:30:00
+@@ -422,6 +422,8 @@
+   OPTION_NO_MULTI_TOC,
+   OPTION_NO_TOC_SORT,
+   OPTION_NON_OVERLAPPING_OPD,
++  /* Used by emultempl/pdp11rt11sav.em.  */
++  OPTION_RT11_STACK,
+   /* Used by emultempl/riscvelf.em.  */
+   OPTION_RELAX_GP,
+   OPTION_NO_RELAX_GP,
