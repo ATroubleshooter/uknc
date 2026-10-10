@@ -35,6 +35,10 @@
 #ifndef PPUC_INTERNAL_H
 #define PPUC_INTERNAL_H
 
+// The public API this one extends: ppuc_write_buf() lives there now,
+// and the files below are its own callers as much as anyone else's.
+#include "ppu_client.h"
+
 #define PPU_CSR (*(volatile unsigned char *)0176674)
 #define PPU_DATA (*(volatile unsigned char *)0176676)
 
@@ -81,18 +85,6 @@ struct ppu_desc {
 // interrupt from landing mid-handshake. Returns nonzero (true) on
 // success, zero if the PPU reported an error via desc->stat.
 int ppuc_request(struct ppu_desc *desc);
-
-// Copies size bytes from buf into PPU memory at ppu_addr, which the
-// caller must already have gotten from a successful ppuc_alloc() --
-// the PPU reads the buffer directly out of CPU memory once told where
-// and how much, the same as PRUN's own PPU_F_WRITE (PF.WLB) call.
-// Shared by ppuc_load.c and ppuc_load_reloc.c; not part of the public
-// API (see ppu_client.h) since it needs an address ppuc_alloc()
-// already handed out, not something a caller would reach for on its
-// own. Returns nonzero (true) on success, zero on failure (caller maps
-// to errno).
-int ppuc_write_buf(unsigned short ppu_addr, const void *buf,
-                    unsigned int size);
 
 // Set to 1 by ppuc_run() every time it starts a PPU program, and
 // cleared by ppuc_send()'s first call after that (see ppuc_send.c for

@@ -56,6 +56,26 @@ int ppuc_run(unsigned short ppu_addr);
 // the offset. ppu.gdb's own ppu-symbols command does exactly that.
 extern unsigned short ppuc_code_base;
 
+// Copies size bytes from buf into PPU memory at ppu_addr -- the PPU
+// reads the buffer directly out of CPU memory once told where and how
+// much, the same as PRUN's own PPU_F_WRITE (PF.WLB) call.
+//
+// Where the address comes from is the caller's business: usually a
+// successful ppuc_alloc(), but a program that manages the PPU's memory
+// map itself -- laying its own code and buffers out at fixed addresses
+// known at build time -- has no allocator to ask, and this is how it
+// puts an image there. ppuc_load() and ppuc_load_reloc() are the
+// allocate-and-copy pair built on top of this.
+//
+// size must be even: the transfer counts words, and an odd size would
+// leave the last byte behind.
+//
+// Unlike the rest of this API it returns nonzero (true) on success and
+// zero on failure, with errno untouched -- it is the raw transfer the
+// others map onto their own errno conventions.
+int ppuc_write_buf(unsigned short ppu_addr, const void *buf,
+                   unsigned int size);
+
 // Allocates size bytes of PPU memory (see ppuc_alloc()) and copies buf
 // into it unmodified -- for code that's already position-independent
 // and needs no relocation; see ppuc_load_reloc() otherwise.
