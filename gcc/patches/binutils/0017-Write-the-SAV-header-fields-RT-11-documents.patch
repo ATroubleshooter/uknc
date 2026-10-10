@@ -1,0 +1,225 @@
+From: Yury Klushin <digger@live.ru>
+Date: Fri, 10 Oct 2026 19:30:00 +0300
+Subject: [PATCH] Write the SAV header fields RT-11 documents
+
+The three header fields this backend fills in were worked out from two
+reference tools (lda2sav.c and savbmap.c) rather than from the format's
+own description, and against the description -- table 2-10,
+"Information in Block 0 of a .SAV Image", of the RT-11 Volume and File
+Formats Manual, AA-PD6PA-TC, section 2.6 -- all three were off.  Every
+other word of block 0 checks out, including the bitmap's bit order,
+both against that table and against images built by DEC's own LINK
+(DATE.SAV, DUMP.SAV, DIR.SAV and PIP.SAV out of this project's
+resources/rt11os.dsk).
+
+Word 050 is "the program's high limit", which the LINK chapter of the
+RT-11 System Utilities Manual spells out as "highest memory address
+used by the program".  We wrote the length of the file instead.  For
+every program this toolchain builds those are different numbers,
+because .bss is memory the program uses that no byte of the file
+describes: hello.sav's word 050 was 023100, which is exactly where its
+.bss starts, rather than 025640, where .bss ends.  The writer already
+had the right number -- highest_alloc, which it computed for the SP
+word -- so this is a matter of writing it in the one place that asks
+for it.  (A program whose .bss runs past the 64K address space would
+have had that number silently truncated into the word; it is now an
+error, since nothing else in the writer would catch it.)
+
+The file was written at its exact byte length, leaving the last block
+short while the bitmap claimed it whole -- so a monitor following the
+bitmap reads 512 bytes out of a block the file only partly defines.
+RT-11 is block-granular throughout: the directory records a file's
+length in blocks, and all four of DEC's images above are multiples of
+512.  Nothing broke only because rt11dsk zero-pads the tail block on
+the way to the volume; now the file itself is padded, as LINK pads its
+own.
+
+The initial SP in word 042 was max(16896, the program's own top), which
+is to say somewhere *above* the program.  RT-11's default is 01000 --
+below it, in the free low memory above the system communication area --
+and that is what DEC's images carry.  Below is the safe side: crt0
+replaces SP with .SETTOP's answer before it does anything else, so this
+value only has to survive that one EMT's automatic push of PC/PS, and
+below the program it survives it for a program of any size.  That is
+what the 16896 guess was trying to do and could not, which is why it
+had grown the max() in the first place.
+
+Verified by rebuilding every example and test: each one's word 050 now
+lands exactly on the end of .bss as its link map reports it, each file
+is a whole number of blocks, each carries SP 01000 -- and hello,
+fileio, rdwr, lseek, float and math still run on the machine and still
+pass.
+---
+ bfd/sav-pdp11.c | 123 +++++++++++++++++++++++++---------------------------
+ 1 file changed, 58 insertions(+), 65 deletions(-)
+
+diff -urN a/bfd/sav-pdp11.c b/bfd/sav-pdp11.c
+--- a/bfd/sav-pdp11.c	2026-10-10 19:30:00
++++ b/bfd/sav-pdp11.c	2026-10-10 19:30:00
+@@ -36,24 +36,20 @@
+        byte -- used by RT-11 for core allocation.
+      - word index 020 (octal), byte offset 040: the program's start
+        (entry) address.
+-     - word index 021 (octal), byte offset 042: initial SP -- the top
+-       of memory available to a user job (SAV_STACK_ADDRESS below, or
+-       the program's own top if that's higher -- see
+-       sav_pdp11_write_object_contents), *not* the entry address.
+-       RT-11 copies this word into low memory at address 042 before
+-       transferring control, so a program's startup code can read it
+-       back via `mov @$042,sp` instead of hardcoding a stack address of
+-       its own.
++     - word index 021 (octal), byte offset 042: initial SP, *not* the
++       entry address.  RT-11 copies this word into low memory at address
++       042 before transferring control, so a program's startup code can
++       read it back via `mov @$042,sp` instead of hardcoding a stack
++       address of its own.  See SAV_DEFAULT_STACK_ADDRESS below.
+      - word index 024 (octal), byte offset 050: the program's "high
+-       limit" -- total image size in bytes.
++       limit", that is the highest memory address it uses -- which
++       includes .bss, and so is *not* the length of the file.
+    Everything else in the header is zero.
+ 
+-   These field offsets were reverse-engineered from two known-working
+-   reference tools already used by this toolchain,
+-   pdp11-toolchain/hello-gcc/lda2sav.c and savbmap.c -- both of which
+-   (incorrectly) set the initial-SP word to the entry address rather
+-   than the top of user memory; this backend does not repeat that
+-   mistake (see SAV_STACK_ADDRESS).
++   The header layout is the one documented in table 2-10, "Information
++   in Block 0 of a .SAV Image", of the RT-11 Volume and File Formats
++   Manual (AA-PD6PA-TC, August 1991), section 2.6, cross-checked field
++   by field against images built by DEC's own LINK.
+ 
+    Modeled on bfd/binary.c and bfd/srec.c: like binary.c, the "address
+    space" is what defines file layout; like srec.c, we need to write a
+@@ -69,40 +65,32 @@
+ 
+ /* A PDP-11 address space is 64K.  */
+ #define SAV_IMAGE_SIZE		65536
+-#define SAV_HEADER_SIZE		  512
+ 
++/* RT-11 volumes, and so RT-11 files, are made of 512-byte blocks; the
++   header below is block 0 of the image.  */
++#define SAV_BLOCK_SIZE		  512
++
+ /* The header block reserves addresses 0 through 0777 (octal); real
+    program content starts at 01000 (decimal 512).  */
+ #define SAV_LOAD_ADDRESS	  512
+ 
+-/* Default top of memory available to a user job under this project's
+-   RT-11 configuration: the resident monitor (RT11SJ.SYS, currently
+-   40448 bytes on disk, taken here as an upper bound on its resident
+-   footprint) sits immediately below the fixed Unibus I/O page at
+-   0160000, so 0160000 - 40448 = 041000 (16896 decimal) is the highest
+-   address a *small* program can assume is safe without asking.  RT-11
+-   itself copies this same value from word SAV_SP_WORD of the file we
+-   write here into low memory at address 042 (octal) before
+-   transferring control, so a program's startup code can pick it up via
+-   `mov @$042,sp` instead of hardcoding it -- but only as a
+-   *provisional* value: crt0 immediately asks the monitor for the real
+-   answer via `.SETTOP` and replaces SP with that.  This constant is
+-   necessarily specific to the RT11SJ.SYS build this project ships
+-   (resident driver selection changes the monitor's footprint) --
+-   revisit if that changes.
++/* Initial SP: RT-11's own default for a .SAV image, the one LINK stores
++   when its /M option is not used.  The stack grows down from the
++   program's load address through the free low memory between the top of
++   the system communication area (which ends at 0476) and 01000, which
++   is exactly what every RT-11 program built by LINK does unless it asks
++   for something else.
+ 
+-   Provisional does not mean irrelevant, though: `.SETTOP` is itself an
+-   EMT, and an EMT's trap entry pushes the return PC/PS onto whatever
+-   SP already holds *before* crt0 gets to replace it -- so this value
+-   must never be lower than the program's own top of used memory.  A
+-   program larger than SAV_STACK_ADDRESS (e.g. once printf/rand pull in
+-   enough of libc/libgcc) would otherwise get a provisional SP that
+-   points *inside* its own already-loaded code, and that first EMT's
+-   automatic push corrupts it before the program executes a single
+-   instruction of its own.  sav_pdp11_write_object_contents() guards
+-   against this by raising the written SP word to the program's real
+-   top when that exceeds this default.  */
+-#define SAV_STACK_ADDRESS	16896
++   Keeping the stack *below* the program is what makes this safe
++   regardless of how large the program is: crt0's very first EMT
++   (.SETTOP, which asks the monitor for the real top of memory and
++   raises SP to it) pushes PC/PS through this SP before crt0 gets to
++   replace it, and a value somewhere above the program would put that
++   push inside the program's own already-loaded text once the program
++   grew past it.  (That is not hypothetical: this backend used to write
++   a fixed 16896 here, and a program linked to ~20KB had its code
++   silently corrupted by that first push.)  */
++#define SAV_DEFAULT_STACK_ADDRESS	01000
+ 
+ /* Byte offset of the block-usage bitmap within the header.  */
+ #define SAV_BITMAP_OFFSET	 0360
+@@ -292,18 +280,21 @@
+ 	highest_alloc = end;
+     }
+ 
+-  /* The file itself is written at its exact byte length -- it is *not*
+-     padded out to a block boundary (matching the reference lda2sav.c
+-     tool this backend replaces).  Only the block-usage bitmap below
+-     rounds up, since it has to describe whole blocks.  */
++  /* Round the file out to a whole number of blocks, the way LINK does:
++     RT-11 records a file's length in blocks, the monitor loads whole
++     blocks, and the bitmap below can only describe whole blocks, so a
++     short final block would leave the monitor reading bytes this file
++     never defined.  The image buffer is zeroed, so the padding is
++     zeros.  */
+   image_size = highest;
+   if (image_size > SAV_IMAGE_SIZE)
+     image_size = SAV_IMAGE_SIZE;
++  image_size = ((image_size + SAV_BLOCK_SIZE - 1)
++		/ SAV_BLOCK_SIZE) * SAV_BLOCK_SIZE;
+ 
+-  /* Block-usage bitmap: mark every 512-byte block from 0 up to and
+-     including the last one actually used.  */
+-  blocks = (unsigned int) ((image_size + SAV_HEADER_SIZE - 1)
+-			    / SAV_HEADER_SIZE);
++  /* Block-usage bitmap: mark every block from 0 up to and including the
++     last one actually used.  */
++  blocks = (unsigned int) (image_size / SAV_BLOCK_SIZE);
+   full_bytes = blocks / 8;
+   rem_bits = blocks % 8;
+   memset (image + SAV_BITMAP_OFFSET, 0xff, full_bytes);
+@@ -315,23 +306,25 @@
+   if (start == 0)
+     start = SAV_LOAD_ADDRESS;
+ 
+-  /* SAV_STACK_ADDRESS is only a *default* -- it assumes a program small
+-     enough to fit entirely below the resident monitor's footprint.  A
+-     program whose own code/data (including .bss) extends past that
+-     point needs a provisional SP at least as high as its own top,
+-     otherwise crt0's very first EMT (`.SETTOP`, before `mov r0,sp`
+-     replaces this value with the monitor's real answer) pushes PC/PS
+-     onto a stack that starts inside the program's own already-loaded
+-     text, silently corrupting it.  (Found via a real crash: a program
+-     linked to ~20KB had this word set to the hardcoded 16896, and its
+-     first EMT clobbered code just below that boundary.)  */
+-  sp = SAV_STACK_ADDRESS;
+-  if (highest_alloc > sp)
+-    sp = highest_alloc;
++  sp = SAV_DEFAULT_STACK_ADDRESS;
+ 
++  /* The high limit is the highest memory address the program uses, not
++     the length of the file: .bss occupies real memory that no byte of
++     the file describes.  */
++  if (highest_alloc > SAV_IMAGE_SIZE)
++    {
++      _bfd_error_handler
++	/* xgettext:c-format */
++	(_("%pB: the program's memory image does not fit in the 64K "
++	   "PDP-11 address space"),
++	 abfd);
++      bfd_set_error (bfd_error_bad_value);
++      return false;
++    }
++
+   bfd_putl16 (start, image + SAV_START_WORD * 2);
+   bfd_putl16 (sp, image + SAV_SP_WORD * 2);
+-  bfd_putl16 ((bfd_vma) image_size, image + SAV_HIGHLIMIT_WORD * 2);
++  bfd_putl16 (highest_alloc, image + SAV_HIGHLIMIT_WORD * 2);
+ 
+   if (bfd_seek (abfd, (file_ptr) 0, SEEK_SET) != 0)
+     return false;

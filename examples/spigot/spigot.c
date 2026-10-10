@@ -1,11 +1,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-// MAX_N sizes r[], a *stack*-resident array (2 bytes/digit): this project's
-// RT-11 configuration gives a program only ~4.5KB of combined stack+heap
-// above its own loaded image (SAV_STACK_ADDRESS=16896 in bfd/sav-pdp11.c,
-// minus this program's own ~12KB image size) before running into the
-// resident monitor -- there's no guard page, so overrunning it silently
+// MAX_N sizes r[], a *stack*-resident array (2 bytes/digit).  crt0 asks the
+// monitor for the top of free memory (.SETTOP) and puts the stack there, so
+// on this project's RT-11 configuration the stack grows down from ~45.6KB
+// toward this program's own ~14KB image, and shares what is between them
+// with the heap -- there's no guard page, so overrunning it silently
 // corrupts the program's own code/data instead of a clean crash. 1500
 // keeps r[] at 3002 bytes, leaving comfortable headroom.
 #define MAX_N 1500

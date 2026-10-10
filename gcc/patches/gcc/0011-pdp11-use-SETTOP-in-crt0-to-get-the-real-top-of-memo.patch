@@ -5,15 +5,15 @@ Subject: [PATCH] pdp11: use .SETTOP in crt0 to get the real top of memory, not
  a link-time guess
 
 The initial SP crt0rt.s reads from the SAV header (word offset 042,
-`mov @$042, sp`) is only what sav-pdp11.c's own
-sav_pdp11_write_object_contents() could compute at link time:
-max(SAV_STACK_ADDRESS, program's own _end). That default
-(SAV_STACK_ADDRESS = 16896) assumes a specific resident-monitor
-footprint for one particular RT11SJ.SYS build; once a program's own
-_end exceeds it, the header value becomes exactly the program's own
-top -- zero headroom for stack or heap beyond newlib's own
-RT11_STACK_MARGIN (512 bytes, see libc/sys/rt11/sbrk.c), regardless of
-how much memory the machine this actually boots on has genuinely free.
+`mov @$042, sp`) is only what the image was linked with: RT-11's own
+default of 01000, which puts the stack in the free low memory just
+below the program, or whatever ld's --stack= asked for instead. Either
+way it is a link-time decision that says nothing about how much memory
+the machine this actually boots on has genuinely free -- and with the
+default a program has a few hundred bytes of stack below itself and no
+heap at all, since newlib's _sbrk measures the heap against SP
+(RT11_STACK_MARGIN, 512 bytes, see libc/sys/rt11/sbrk.c) and SP starts
+out below _end.
 
 RT-11 has a real, documented way to ask for that instead: .SETTOP
 (EMT 354, per the RT-11 System Macro Library Manual). A program passes
@@ -27,11 +27,10 @@ link-time guess.
 
 Added right after the existing `mov @$042, sp`, guarded with a
 compare: only raise SP to .SETTOP's answer when it's actually higher
-than the header's own value, in case some future RT11SJ.SYS build
-(different resident driver selection -- SAV_STACK_ADDRESS's own
-comment already flags this as build-specific) leaves *less* free
-memory than the static link-time guess assumed; never move SP
-backwards into what could already be in-use stack.
+than the header's own value, in case a monitor leaves *less* free
+memory than the stack address the image was linked with -- a program
+linked with an explicit --stack= is the case that matters here; never
+move SP backwards into what could already be in-use stack.
 
 Verified on real hardware (ukncbtl-debugger emulator) against a real
 program that had outgrown its available memory: SP at main() entry
@@ -39,6 +38,11 @@ went from 22142 (link-time header value, main()'s own malloc() for a
 paged-in RT-11 object file was failing with ENOMEM) to 45626 (.SETTOP
 answer) -- roughly double the headroom, and the same malloc() call
 that was failing now succeeds with room to spare.
+
+Measured again under gdb now that the header carries RT-11's own
+default: location 042 holds 01000, exactly what the linker wrote, and
+SP at main() entry is 0131072 (45626) -- the monitor's answer, not the
+header's.
 ---
  libgcc/config/pdp11/crt0rt.s | 26 ++++++++++++++++++++++++++
  1 file changed, 26 insertions(+)
@@ -47,28 +51,28 @@ diff --git a/libgcc/config/pdp11/crt0rt.s b/libgcc/config/pdp11/crt0rt.s
 index cfc6a0096bc53..f85dd60ffe8bf 100644
 --- a/libgcc/config/pdp11/crt0rt.s
 +++ b/libgcc/config/pdp11/crt0rt.s
-@@ -12,6 +12,32 @@ cmdbuf_max = 80
+@@ -12,6 +12,32 @@ start:
  start:
          mov   @$042, sp   // SP comes from the SAV header (RT-11 sets it before we start)
  
-+        // That header value is only a link-time guess (max(16896, this
-+        // program's own _end) -- see bfd/sav-pdp11.c's own
-+        // sav_pdp11_write_object_contents(), which has no idea how much
-+        // memory the resident monitor/drivers on the machine this actually
-+        // boots on leave free). .SETTOP (EMT 354) asks the monitor for the
-+        // *real* top of memory instead: R0 in is the requested address, R0
-+        // out is the actual highest legal address for this job -- never
-+        // higher than requested, silently clamped down if the request was
-+        // too big (RT-11 System Macro Library Manual, .SETTOP: "the address
-+        // returned will be the highest legal address for the job, not the
-+        // requested address"). Requesting the theoretical maximum
++        // That header value is only RT-11's own default -- 01000, the free
++        // low memory just below the program, or whatever ld's --stack=
++        // asked for instead (see bfd/sav-pdp11.c) -- and it says nothing
++        // about how much memory the resident monitor/drivers on the machine
++        // this actually boots on leave free. .SETTOP (EMT 354) asks the
++        // monitor for the *real* top of memory instead: R0 in is the
++        // requested address, R0 out is the actual highest legal address for
++        // this job -- never higher than requested, silently clamped down if
++        // the request was too big (RT-11 System Macro Library Manual,
++        // .SETTOP: "the address returned will be the highest legal address
++        // for the job, not the requested address"). Requesting the maximum
 +        // (0177776, the highest even address) and taking whatever comes
 +        // back is the documented way to discover that ceiling at runtime.
 +        //
 +        // Guarded with a compare rather than trusting the EMT result
 +        // outright: if .SETTOP's answer is somehow *not higher* than the
 +        // header value already in SP (e.g. this ROM's own monitor/drivers
-+        // turn out to leave less room than sav-pdp11.c assumed), keep the
++        // leave less room than the header's stack address), keep the
 +        // link-time SP instead of moving backwards.
 +        mov   $0177776, r0
 +        emt   0354
