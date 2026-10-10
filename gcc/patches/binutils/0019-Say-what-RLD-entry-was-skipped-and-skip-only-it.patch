@@ -1,0 +1,260 @@
+From: Yury Klushin <digger@live.ru>
+Date: Sat, 11 Oct 2026 00:30:00 +0300
+Subject: [PATCH] Say what RLD entry was skipped, and skip only it
+
+An RLD entry this reader cannot turn into a relocation used to end the
+walk of its block: the length of a complex expression (entry type 017)
+is not in the size table, so the loop hit its `arg < 0' guard and
+broke, with nothing said.  Everything after that entry in the same
+block was lost with it, and a complex expression is far from the only
+thing that followed.
+
+Measured on a module whose complex entry sits between ordinary ones:
+of the four entries dumpobj lists, this reader built one, and the
+program read 010 and 012 out of a table where the two relocated
+addresses belonged.  Worse, an entry can also switch the section the
+following entries apply to (type 007), and when that switch is the
+entry that got dropped, the relocations after it land on the *previous*
+section: a two-psect module had BCODE's two relocations attributed to
+ACODE, which is two bytes long, one of them past its end.  No
+diagnostic in either case.
+
+So: step over the entry instead of giving up on the block, and say what
+was skipped and where.
+
+Stepping over means knowing the length, which for a complex expression
+means walking its string of operation codes -- table 2-7 of the RT-11
+Volume and File Formats Manual: codes 0 through 011 carry no operand,
+016 carries four bytes of RADIX-50 name, 017 a section number and
+offset, 020 a constant, and the string ends with a store, 012 or 013.
+obj_pdp11_complex_size() does that and reports -1 for a string that
+does not end inside its block; the two cases that remain genuinely
+unknowable -- an entry type the manual does not define, and an entry
+running off the end of its block -- still stop the walk, but now with a
+message naming the type.
+
+Saying so is two halves.  The message itself names the kind and the
+place (`CODE+0x2: a complex relocation expression (RLD entry type 017)
+is not supported'), which is as much as a reader can offer.  And the
+section carrying such an entry is marked, so that asking it for its
+relocations fails: that is what every link does, so a link that would
+have come out quietly wrong now fails outright, while the file stays
+readable for everything else -- its symbols, its contents, its other
+sections' relocations.  There is no third behaviour available in a BFD
+backend; relocations here are built when the file is opened, and
+failing *that* would only say "file format not recognized".
+
+No ordinary object is affected.  A complex expression is what MACRO-11
+emits for an expression that goes beyond + and - over a relocatable or
+external symbol -- multiplication, division, the logical operators, a
+complement, or two relocatable symbols in one expression -- and there
+is not one in DEC's own SYSLIB.OBJ: 112 modules, 166 RLD blocks, 254
+entries, of types 01, 02, 04, 07, 010, 015 and 016 only.  Verified that
+the library still lists and reads as before, that a plain MACRO-11
+module still links and runs on the machine (a .word table of addresses
+comes out relocated), and that hello, math and fileio still pass.
+---
+ bfd/obj-pdp11.c | 149 +++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 146 insertions(+), 3 deletions(-)
+
+diff -urN a/bfd/obj-pdp11.c b/bfd/obj-pdp11.c
+--- a/bfd/obj-pdp11.c	2026-10-11 00:30:00
++++ b/bfd/obj-pdp11.c	2026-10-11 00:30:00
+@@ -134,6 +134,17 @@
+ /* Set in the command byte when the relocation is of a byte, not a
+    word.  */
+ #define OBJ_RLD_BYTE		0200
++
++/* Operation codes inside a complex relocation expression (RLD type 017;
++   table 2-7 of the manual).  Codes 0 through 011 -- the arithmetic and
++   the two unary operations -- carry no operand; these are the ones that
++   do, plus the two that end the string.  */
++#define OBJ_CPLX_LAST_PLAIN	011	/* Up to here: no operand.  */
++#define OBJ_CPLX_STORE		012	/* Ends the string.  */
++#define OBJ_CPLX_STORE_DISP	013	/* Ends it, PC-relative.  */
++#define OBJ_CPLX_GLOBAL		016	/* + 4 bytes of RADIX-50 name.  */
++#define OBJ_CPLX_PSECT		017	/* + section number and offset.  */
++#define OBJ_CPLX_CONST		020	/* + a 16-bit constant.  */
+ 
+ /* An RLD entry's displacement is measured from its TXT record's type
+    word, which is four bytes ahead of that record's data, so the first
+@@ -174,6 +185,7 @@
+   bfd_byte *contents;
+   arelent *relocs;
+   unsigned int relcount;	/* Counted, then filled.  */
++  bool unsupported;		/* Carries an RLD entry we cannot use.  */
+ };
+ 
+ #define obj_section_data(sec) \
+@@ -262,7 +274,51 @@
+     case 14: return 6;		/* P-sect additive displaced.  */
+     case 16: return 2;		/* Resident library.  */
+     default: return -1;
++    }
++}
++
++/* The whole length of a complex relocation entry at AT in a block of
++   SIZE bytes -- its command and displacement bytes plus the string of
++   operation codes that follows them -- or -1 if the string does not end
++   inside the block.  Knowing this is what lets the walk below step over
++   an entry it cannot use instead of giving up on the rest of the
++   block.  */
++
++static int
++obj_pdp11_complex_size (const bfd_byte *body, size_t size, size_t at)
++{
++  size_t k = at + 2;
++
++  while (k < size)
++    {
++      unsigned int op = body[k++];
++
++      switch (op)
++	{
++	case OBJ_CPLX_STORE:
++	case OBJ_CPLX_STORE_DISP:
++	  return (int) (k - at);
++
++	case OBJ_CPLX_GLOBAL:
++	  k += 4;
++	  break;
++
++	case OBJ_CPLX_PSECT:
++	  k += 3;
++	  break;
++
++	case OBJ_CPLX_CONST:
++	  k += 2;
++	  break;
++
++	default:
++	  if (op > OBJ_CPLX_LAST_PLAIN)
++	    return -1;		/* Not an operation code at all.  */
++	  break;
++	}
+     }
++
++  return -1;
+ }
+ 
+ /* bfd_alloc + strcpy, which libbfd has no spelling for.  */
+@@ -634,6 +690,40 @@
+    the relocation records, and the relocations themselves -- counted on
+    the way through once, then built.  */
+ 
++/* Say that an RLD entry cannot be turned into a relocation, and mark
++   the section it was meant to modify.  WHAT names the entry and DISP is
++   its displacement byte, which says where in the section the word it
++   would have modified sits.
++
++   The mark is what keeps a bad link from happening quietly: the file
++   stays readable -- its symbols, its contents and its other
++   relocations are all still there to look at -- but asking a marked
++   section for its relocations fails, and that is what every link does
++   (see obj_pdp11_canonicalize_reloc).  */
++
++static void
++obj_pdp11_unsupported (struct obj_pdp11_walk *walk, unsigned int disp,
++		       const char *what)
++{
++  struct obj_pdp11_section_data *data
++    = walk->current != NULL ? obj_section_data (walk->current) : NULL;
++
++  if (data != NULL)
++    data->unsupported = true;
++
++  if (walk->current != NULL && disp >= OBJ_RLD_DISP_BIAS)
++    _bfd_error_handler
++      /* xgettext:c-format */
++      (_("%pB: %pA+%#lx: %s is not supported"),
++       walk->abfd, walk->current,
++       (unsigned long) (walk->txt_offset + disp - OBJ_RLD_DISP_BIAS),
++       what);
++  else
++    _bfd_error_handler
++      /* xgettext:c-format */
++      (_("%pB: %s is not supported"), walk->abfd, what);
++}
++
+ static bool
+ obj_pdp11_scan_text (struct obj_pdp11_walk *walk, unsigned int type,
+ 		     const bfd_byte *body, size_t size)
+@@ -652,8 +742,48 @@
+ 	  unsigned int cmd = body[k] & 0x7f;
+ 	  int arg = obj_pdp11_rld_arg_size (cmd);
+ 
+-	  if (arg < 0 || k + 2 + (size_t) arg > size)
+-	    break;
++	  /* A complex expression is a string of operation codes rather
++	     than a fixed argument list, and no ELF relocation can stand
++	     for one: R_PDP11_16 is a symbol plus an addend, with nowhere
++	     to put the arithmetic.  Step over it by its real length, so
++	     that the ordinary entries after it in this block -- which we
++	     can represent perfectly well -- are not lost with it.  */
++	  if (cmd == OBJ_RLD_COMPLEX)
++	    {
++	      int len = obj_pdp11_complex_size (body, size, k);
++
++	      if (walk->counting)
++		obj_pdp11_unsupported (walk, body[k + 1],
++				       _("a complex relocation expression "
++					 "(RLD entry type 017)"));
++	      if (len < 0)
++		break;		/* It does not end in this block.  */
++	      k += (size_t) len;
++	      continue;
++	    }
++
++	  /* An entry type the manual does not define, or one that runs
++	     off the end of its block: either way the next entry's offset
++	     is unknowable, so the walk stops -- but not silently.  */
++	  if (arg < 0)
++	    {
++	      char what[48];
++
++	      /* xgettext:c-format */
++	      snprintf (what, sizeof what, _("RLD entry type 0%o"), cmd);
++	      if (walk->counting)
++		obj_pdp11_unsupported (walk, body[k + 1], what);
++	      break;
++	    }
++
++	  if (k + 2 + (size_t) arg > size)
++	    {
++	      if (walk->counting)
++		obj_pdp11_unsupported (walk, body[k + 1],
++				       _("an RLD entry that runs past the "
++					 "end of its block"));
++	      break;
++	    }
+ 
+ 	  if (cmd == OBJ_RLD_LOCCTR_DEF)
+ 	    {
+@@ -914,13 +1044,26 @@
+ }
+ 
+ static long
+-obj_pdp11_canonicalize_reloc (bfd *abfd ATTRIBUTE_UNUSED, asection *sec,
++obj_pdp11_canonicalize_reloc (bfd *abfd, asection *sec,
+ 			      arelent **relptr,
+ 			      asymbol **symbols ATTRIBUTE_UNUSED)
+ {
+   struct obj_pdp11_section_data *data = obj_section_data (sec);
+   unsigned int i;
+ 
++  /* Reading the file was fine; using these relocations is not.  What
++     was skipped was already reported, by kind and by place, when the
++     file was read -- see obj_pdp11_unsupported.  */
++  if (data != NULL && data->unsupported)
++    {
++      _bfd_error_handler
++	/* xgettext:c-format */
++	(_("%pB: %pA needs relocations this reader cannot represent"),
++	 abfd, sec);
++      bfd_set_error (bfd_error_invalid_operation);
++      return -1;
++    }
++
+   if (data == NULL || data->relocs == NULL)
+     {
+       *relptr = NULL;
