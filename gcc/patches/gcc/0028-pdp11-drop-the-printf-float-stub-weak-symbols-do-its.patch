@@ -185,7 +185,7 @@ index e9479024a2d23..9220c65e906eb 100644
 @@ -16,7 +11,3 @@ crt0rt.o: $(srcdir)/config/pdp11/crt0rt.s
  parse_args.o: $(srcdir)/config/pdp11/parse_args.c
  	$(GCC_FOR_TARGET) $(INCLUDES) $(CFLAGS) -fomit-frame-pointer -msoft-float \
- 		-O2 -c $(srcdir)/config/pdp11/parse_args.c -o parse_args.o
+ 		-Os -c $(srcdir)/config/pdp11/parse_args.c -o parse_args.o
 -
 -printf_float_stub.o: $(srcdir)/config/pdp11/printf_float_stub.c
 -	$(GCC_FOR_TARGET) $(INCLUDES) $(CFLAGS) -fomit-frame-pointer -msoft-float \

@@ -354,4 +354,4 @@ index 0000000000000..ceadd6a7bf8c8
 +
 +parse_args.o: $(srcdir)/config/pdp11/parse_args.c
 +	$(GCC_FOR_TARGET) $(INCLUDES) $(CFLAGS) -fomit-frame-pointer -msoft-float \
-+		-O2 -c $(srcdir)/config/pdp11/parse_args.c -o parse_args.o
++		-Os -c $(srcdir)/config/pdp11/parse_args.c -o parse_args.o
