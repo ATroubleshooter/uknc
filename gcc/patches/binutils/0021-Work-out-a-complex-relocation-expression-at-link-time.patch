@@ -1,0 +1,740 @@
+From: Yury Klushin <digger@live.ru>
+Date: Fri, 10 Oct 2026 19:30:00 +0300
+Subject: [PATCH] Work out a complex relocation expression at link time
+
+MACRO-11 writes a complex relocation expression (RLD entry type 017)
+for an expression that goes beyond + and - over a relocatable or
+external symbol: multiplication, division, the logical operators, a
+complement, two relocatable symbols in one expression.  No ELF
+relocation can stand for one -- R_PDP11_16 is a symbol plus an addend,
+with nowhere to put the arithmetic -- so until now the reader skipped
+such an entry, said so, and refused the section's relocations outright,
+which is to say the module could not be linked.
+
+It can be worked out instead, and the linker is the one place that can
+do it: the expression is arithmetic over addresses, and addresses are
+final only once sections have been placed.  So the reader keeps the
+expression -- its string of operation codes and the place in the
+section whose word it computes -- and bfd_obj_pdp11_resolve_complex(),
+declared in the new bfd/obj-pdp11.h, evaluates it and writes the word
+into the section contents the linker is about to copy out.
+
+The evaluator follows table 2-7 of the RT-11 Volume and File Formats
+Manual to the letter: reverse Polish over a stack, operands 16-bit and
+two's complement, the result truncated from the left, a division by
+zero yielding zero with a warning, and the PC displacement -- the
+difference between the two store operations, 012 and 013 -- applied to
+the result only, never to an operand.  A global operand (016) is looked
+up in the link's hash table, a p-sect operand (017) names its p-sect by
+the place it has in the GSD, which is undocumented but what MACRO-11
+and LINK both do.
+
+The hook is finish, in the new emultempl/pdp11rt11cplx.em, shared by
+all three rt11 emulations -- sourced by the two that have an
+EXTRA_EM_FILE of their own, named as the EXTRA_EM_FILE of the one that
+does not.  lang_process() calls it after lang_size_sections() and the
+final lang_do_assignments(), so addresses and symbols are final and the
+hash table is alive, and before ldwrite(), so the words it writes are
+still ahead of the copy that puts them in the output.  The reader goes
+on refusing a section's relocations until this has run, so a tool that
+is not a link -- objcopy -- cannot quietly produce a file in which the
+expression was never computed; and relocatable output, which would have
+to carry the expression over rather than resolve it, is refused with
+its own message.
+
+Checked against DEC's own LINK, on the expression RT-11's MACRO
+produces for `BUF+<N-1>*2' (which in MACRO-11, where there is no
+operator precedence, means (BUF+N-1)*2):
+
+    LINK V05.45:  (BUF+01747)*2  = 06076,  minus 01022+2  -> 05052
+    this ld:      (OBUF+01747)*2 = 075356, minus 032052+2 -> 043302
+
+each matching the word in its own image to the bit.  Also checked by
+running the arithmetic: a module whose code loads through a displaced
+complex expression and whose data word is a plain one links and runs on
+the machine, reading the right word (0202) and storing the right
+address; an undefined global in an expression is named and the link
+fails; a division by zero warns and yields zero; `a/2' over a
+relocatable symbol comes out exactly half of it. Nothing else moved:
+DEC's SYSLIB.OBJ reads as before, a plain MACRO-11 module still links
+and runs, and hello, math, fileio, rdwr, lseek and float all pass.
+---
+ bfd/Makefile.am               |   2 +-
+ bfd/Makefile.in               |   2 +-
+ bfd/obj-pdp11.c               | 389 +++++++++++++++++++++++++++++++++++++++++++++++++++-
+ bfd/obj-pdp11.h               |  44 ++++++
+ bfd/po/SRC-POTFILES.in        |   1 +
+ ld/emulparams/pdp11rt11.sh    |   4 +
+ ld/emultempl/pdp11rt11cplx.em |  72 ++++++++++
+ ld/emultempl/pdp11rt11rel.em  |   5 +
+ ld/emultempl/pdp11rt11sav.em  |   5 +
+ 9 files changed, 511 insertions(+), 13 deletions(-)
+
+diff -urN a/bfd/Makefile.am b/bfd/Makefile.am
+--- a/bfd/Makefile.am	2026-10-10 19:30:00
++++ b/bfd/Makefile.am	2026-10-10 19:30:00
+@@ -718,7 +718,7 @@
+ 	libaout.h libbfd.h libcoff.h libecoff.h libhppa.h \
+ 	libpei.h libxcoff.h \
+ 	mach-o.h \
+-	netbsd.h ns32k.h \
++	netbsd.h ns32k.h obj-pdp11.h \
+ 	pef.h pef-traceback.h peicode.h plugin.h \
+ 	sav-pdp11.h som.h sysdep.h \
+ 	version.h vms.h \
+diff -urN a/bfd/Makefile.in b/bfd/Makefile.in
+--- a/bfd/Makefile.in	2026-10-10 19:30:00
++++ b/bfd/Makefile.in	2026-10-10 19:30:00
+@@ -1182,7 +1182,7 @@
+ 	libaout.h libbfd.h libcoff.h libecoff.h libhppa.h \
+ 	libpei.h libxcoff.h \
+ 	mach-o.h \
+-	netbsd.h ns32k.h \
++	netbsd.h ns32k.h obj-pdp11.h \
+ 	pef.h pef-traceback.h peicode.h plugin.h \
+ 	sav-pdp11.h som.h sysdep.h \
+ 	version.h vms.h \
+diff -urN a/bfd/obj-pdp11.c b/bfd/obj-pdp11.c
+--- a/bfd/obj-pdp11.c	2026-10-10 19:30:00
++++ b/bfd/obj-pdp11.c	2026-10-10 19:30:00
+@@ -72,6 +72,12 @@
+ #include "sysdep.h"
+ #include "bfd.h"
+ #include "libbfd.h"
++#include "bfdlink.h"
++#include "obj-pdp11.h"
++
++/* Defined at the bottom of this file; bfd_obj_pdp11_resolve_complex()
++   checks against it.  */
++extern const bfd_target obj_pdp11_vec;
+ #include "libiberty.h"
+ 
+ /* Record framing.  */
+@@ -139,6 +145,16 @@
+    table 2-7 of the manual).  Codes 0 through 011 -- the arithmetic and
+    the two unary operations -- carry no operand; these are the ones that
+    do, plus the two that end the string.  */
++#define OBJ_CPLX_NOP		000	/* Padding.  */
++#define OBJ_CPLX_ADD		001
++#define OBJ_CPLX_SUB		002
++#define OBJ_CPLX_MUL		003
++#define OBJ_CPLX_DIV		004
++#define OBJ_CPLX_AND		005
++#define OBJ_CPLX_OR		006
++#define OBJ_CPLX_XOR		007
++#define OBJ_CPLX_NEG		010	/* Unary minus.  */
++#define OBJ_CPLX_COM		011	/* One's complement, MACRO-11's ^C.  */
+ #define OBJ_CPLX_LAST_PLAIN	011	/* Up to here: no operand.  */
+ #define OBJ_CPLX_STORE		012	/* Ends the string.  */
+ #define OBJ_CPLX_STORE_DISP	013	/* Ends it, PC-relative.  */
+@@ -185,10 +201,25 @@
+   bfd_byte *contents;
+   arelent *relocs;
+   unsigned int relcount;	/* Counted, then filled.  */
++  struct obj_pdp11_complex *complexes;
++  unsigned int cplxcount;	/* Counted, then filled.  */
++  bool resolved;		/* Those expressions have been worked out.  */
+   bool had_text;		/* Some TXT record landed in this p-sect.  */
+   bool unsupported;		/* Carries an RLD entry we cannot use.  */
++  unsigned int number;		/* Which p-sect this is, counting from 0.  */
+ };
+ 
++/* One complex relocation expression (RLD entry type 017), kept for the
++   linker to work out once addresses are final -- see
++   bfd_obj_pdp11_resolve_complex.  */
++
++struct obj_pdp11_complex
++{
++  bfd_vma offset;		/* Of the word it computes, in its section.  */
++  bfd_byte *rpn;		/* Its string of operation codes.  */
++  size_t len;
++};
++
+ #define obj_section_data(sec) \
+   ((struct obj_pdp11_section_data *) (sec)->used_by_bfd)
+ 
+@@ -395,6 +426,10 @@
+   asection *current_psect;	/* P-sect the GSD is listing globals under.  */
+   bfd_vma txt_offset;		/* Where in the section the last TXT went.  */
+   long symcount;		/* Globals counted, then globals filled.  */
++  unsigned int psectno;		/* P-sects seen, which is how they are
++				   numbered: a complex expression names one
++				   by its place in the GSD (undocumented,
++				   but what MACRO-11 and LINK both do).  */
+   bool counting;		/* Count relocations rather than build them.  */
+   bool saw_module_name;
+ };
+@@ -493,6 +528,7 @@
+ 	  if (obj_section_data (sec) == NULL)
+ 	    return false;
+ 	  obj_section_data (sec)->pflags = flags;
++	  obj_section_data (sec)->number = walk->psectno++;
+ 	  walk->current_psect = sec;
+ 	  break;
+ 
+@@ -746,19 +782,51 @@
+ 	  /* A complex expression is a string of operation codes rather
+ 	     than a fixed argument list, and no ELF relocation can stand
+ 	     for one: R_PDP11_16 is a symbol plus an addend, with nowhere
+-	     to put the arithmetic.  Step over it by its real length, so
+-	     that the ordinary entries after it in this block -- which we
+-	     can represent perfectly well -- are not lost with it.  */
++	     to put the arithmetic.  So it does not become a relocation
++	     at all -- it is kept, string and place, for the linker to
++	     work out once addresses are final (see
++	     bfd_obj_pdp11_resolve_complex), and stepping over it by its
++	     real length keeps the ordinary entries after it in this
++	     block, which we can represent perfectly well.  */
+ 	  if (cmd == OBJ_RLD_COMPLEX)
+ 	    {
+ 	      int len = obj_pdp11_complex_size (body, size, k);
+ 
+-	      if (walk->counting)
+-		obj_pdp11_unsupported (walk, body[k + 1],
+-				       _("a complex relocation expression "
+-					 "(RLD entry type 017)"));
+ 	      if (len < 0)
+-		break;		/* It does not end in this block.  */
++		{
++		  if (walk->counting)
++		    obj_pdp11_unsupported (walk, body[k + 1],
++					   _("a complex relocation expression "
++					     "that does not end inside its "
++					     "block"));
++		  break;
++		}
++
++	      if (walk->current != NULL && body[k + 1] >= OBJ_RLD_DISP_BIAS)
++		{
++		  struct obj_pdp11_section_data *data
++		    = obj_section_data (walk->current);
++
++		  if (data == NULL)
++		    break;
++		  if (walk->counting)
++		    data->cplxcount++;
++		  else if (data->complexes != NULL)
++		    {
++		      struct obj_pdp11_complex *cplx
++			= &data->complexes[data->cplxcount++];
++		      size_t n = (size_t) len - 2;
++
++		      cplx->offset = (walk->txt_offset + body[k + 1]
++				      - OBJ_RLD_DISP_BIAS);
++		      cplx->len = n;
++		      cplx->rpn = (bfd_byte *) bfd_alloc (walk->abfd, n);
++		      if (cplx->rpn == NULL)
++			return false;
++		      memcpy (cplx->rpn, body + k + 2, n);
++		    }
++		}
++
+ 	      k += (size_t) len;
+ 	      continue;
+ 	    }
+@@ -944,6 +1012,20 @@
+ 	goto fail;
+       data->relcount = 0;
+       sec->flags |= SEC_RELOC;
++    }
++
++  for (sec = abfd->sections; sec != NULL; sec = sec->next)
++    {
++      struct obj_pdp11_section_data *data = obj_section_data (sec);
++
++      if (data == NULL || data->cplxcount == 0)
++	continue;
++
++      data->complexes = (struct obj_pdp11_complex *)
++	bfd_alloc (abfd, data->cplxcount * sizeof (*data->complexes));
++      if (data->complexes == NULL)
++	goto fail;
++      data->cplxcount = 0;
+     }
+ 
+   walk.current = NULL;
+@@ -1063,6 +1145,276 @@
+   return (sec->reloc_count + 1) * sizeof (arelent *);
+ }
+ 
++/* Deep enough for anything an assembler can write: the whole expression
++   has to fit in one data block, and each operand pushes one value.  */
++#define OBJ_CPLX_STACK	32
++
++/* The p-sect a complex expression names by number.  They are numbered
++   by their place in the GSD -- see struct obj_pdp11_walk.  */
++
++static asection *
++obj_pdp11_section_by_number (bfd *abfd, unsigned int number)
++{
++  asection *sec;
++
++  for (sec = abfd->sections; sec != NULL; sec = sec->next)
++    {
++      struct obj_pdp11_section_data *data = obj_section_data (sec);
++
++      if (data != NULL && data->number == number)
++	return sec;
++    }
++
++  return NULL;
++}
++
++/* Where SEC's byte at OFFSET has ended up in the output.  */
++
++static bfd_vma
++obj_pdp11_final_address (asection *sec, bfd_vma offset)
++{
++  if (sec->output_section == NULL)
++    return sec->vma + offset;
++
++  return sec->output_section->vma + sec->output_offset + offset;
++}
++
++/* Work out one complex expression and write the word it computes.
++
++   Table 2-7 of the RT-11 Volume and File Formats Manual: the string is
++   reverse Polish, the operands are 16-bit and two's complement, the
++   result is truncated from the left without a word said, a division by
++   zero yields zero with a warning, and a PC displacement -- the
++   difference between the two store operations -- applies to the result
++   only, never to an operand.  */
++
++static bool
++obj_pdp11_eval_complex (bfd *abfd, struct bfd_link_info *info,
++			asection *sec, const struct obj_pdp11_complex *cplx)
++{
++  struct obj_pdp11_section_data *data = obj_section_data (sec);
++  long stack[OBJ_CPLX_STACK];
++  unsigned int top = 0;
++  size_t k = 0;
++  long a, b;
++
++  /* Everything is kept sign-extended from 16 bits, so that the two
++     unary operations and the division mean what the assembler meant.  */
++#define SX(v)	((long) (short) (long) (v))
++#define PUSH(v)					\
++  do						\
++    {						\
++      if (top >= OBJ_CPLX_STACK)		\
++	goto malformed;				\
++      stack[top++] = SX (v);			\
++    }						\
++  while (0)
++#define POP(lv)					\
++  do						\
++    {						\
++      if (top == 0)				\
++	goto malformed;				\
++      (lv) = stack[--top];			\
++    }						\
++  while (0)
++
++  while (k < cplx->len)
++    {
++      unsigned int op = cplx->rpn[k++];
++
++      switch (op)
++	{
++	case OBJ_CPLX_NOP:
++	  break;
++
++	case OBJ_CPLX_ADD:
++	  POP (b); POP (a); PUSH (a + b);
++	  break;
++
++	case OBJ_CPLX_SUB:
++	  POP (b); POP (a); PUSH (a - b);
++	  break;
++
++	case OBJ_CPLX_MUL:
++	  POP (b); POP (a); PUSH (a * b);
++	  break;
++
++	case OBJ_CPLX_DIV:
++	  POP (b); POP (a);
++	  if (b == 0)
++	    {
++	      _bfd_error_handler
++		/* xgettext:c-format */
++		(_("%pB: %pA+%#lx: warning: division by zero in a complex "
++		   "relocation expression"),
++		 abfd, sec, (unsigned long) cplx->offset);
++	      PUSH (0);
++	    }
++	  else
++	    PUSH (a / b);
++	  break;
++
++	case OBJ_CPLX_AND:
++	  POP (b); POP (a); PUSH (a & b);
++	  break;
++
++	case OBJ_CPLX_OR:
++	  POP (b); POP (a); PUSH (a | b);
++	  break;
++
++	case OBJ_CPLX_XOR:
++	  POP (b); POP (a); PUSH (a ^ b);
++	  break;
++
++	case OBJ_CPLX_NEG:
++	  POP (a); PUSH (-a);
++	  break;
++
++	case OBJ_CPLX_COM:
++	  POP (a); PUSH (~a);
++	  break;
++
++	case OBJ_CPLX_GLOBAL:
++	  {
++	    struct bfd_link_hash_entry *h;
++	    char *name;
++
++	    if (k + 4 > cplx->len)
++	      goto malformed;
++	    name = obj_pdp11_name (abfd, cplx->rpn + k);
++	    if (name == NULL)
++	      return false;
++	    k += 4;
++
++	    h = bfd_link_hash_lookup (info->hash, name, false, false, true);
++	    if (h != NULL && h->type == bfd_link_hash_indirect)
++	      h = h->u.i.link;
++	    if (h == NULL
++		|| (h->type != bfd_link_hash_defined
++		    && h->type != bfd_link_hash_defweak))
++	      {
++		_bfd_error_handler
++		  /* xgettext:c-format */
++		  (_("%pB: %pA+%#lx: complex relocation expression needs "
++		     "`%s', which is not defined"),
++		   abfd, sec, (unsigned long) cplx->offset, name);
++		bfd_set_error (bfd_error_bad_value);
++		return false;
++	      }
++
++	    PUSH (h->u.def.value
++		  + obj_pdp11_final_address (h->u.def.section, 0));
++	  }
++	  break;
++
++	case OBJ_CPLX_PSECT:
++	  {
++	    asection *target;
++
++	    if (k + 3 > cplx->len)
++	      goto malformed;
++	    target = obj_pdp11_section_by_number (abfd, cplx->rpn[k]);
++	    if (target == NULL)
++	      {
++		_bfd_error_handler
++		  /* xgettext:c-format */
++		  (_("%pB: %pA+%#lx: complex relocation expression names "
++		     "p-sect %u, which this module does not declare"),
++		   abfd, sec, (unsigned long) cplx->offset,
++		   (unsigned) cplx->rpn[k]);
++		bfd_set_error (bfd_error_bad_value);
++		return false;
++	      }
++	    PUSH (obj_pdp11_final_address (target,
++					   bfd_getl16 (cplx->rpn + k + 1)));
++	    k += 3;
++	  }
++	  break;
++
++	case OBJ_CPLX_CONST:
++	  if (k + 2 > cplx->len)
++	    goto malformed;
++	  PUSH (bfd_getl16 (cplx->rpn + k));
++	  k += 2;
++	  break;
++
++	case OBJ_CPLX_STORE:
++	case OBJ_CPLX_STORE_DISP:
++	  POP (a);
++	  if (op == OBJ_CPLX_STORE_DISP)
++	    a -= (long) (obj_pdp11_final_address (sec, cplx->offset) + 2);
++	  if (data == NULL || data->contents == NULL
++	      || cplx->offset + 2 > sec->size)
++	    goto malformed;
++	  bfd_putl16 ((bfd_vma) (a & 0xffff), data->contents + cplx->offset);
++	  return true;
++
++	default:
++	  _bfd_error_handler
++	    /* xgettext:c-format */
++	    (_("%pB: %pA+%#lx: operation code 0%o in a complex relocation "
++	       "expression is not one of the fourteen there are"),
++	     abfd, sec, (unsigned long) cplx->offset, op);
++	  bfd_set_error (bfd_error_bad_value);
++	  return false;
++	}
++    }
++
++ malformed:
++  _bfd_error_handler
++    /* xgettext:c-format */
++    (_("%pB: %pA+%#lx: malformed complex relocation expression"),
++     abfd, sec, (unsigned long) cplx->offset);
++  bfd_set_error (bfd_error_bad_value);
++  return false;
++
++#undef POP
++#undef PUSH
++#undef SX
++}
++
++/* Work out every complex expression in ABFD; see obj-pdp11.h.  */
++
++bool
++bfd_obj_pdp11_resolve_complex (bfd *abfd, struct bfd_link_info *info)
++{
++  asection *sec;
++
++  if (abfd->xvec != &obj_pdp11_vec)
++    return true;
++
++  for (sec = abfd->sections; sec != NULL; sec = sec->next)
++    {
++      struct obj_pdp11_section_data *data = obj_section_data (sec);
++      unsigned int i;
++
++      if (data == NULL || data->cplxcount == 0 || data->resolved)
++	continue;
++
++      /* Relocatable output would have to carry the expression over
++	 rather than work it out, and an ELF relocation has nowhere to
++	 carry it.  */
++      if (bfd_link_relocatable (info))
++	{
++	  _bfd_error_handler
++	    /* xgettext:c-format */
++	    (_("%pB: %pA: complex relocation expressions cannot be carried "
++	       "into relocatable output"),
++	     abfd, sec);
++	  bfd_set_error (bfd_error_invalid_operation);
++	  return false;
++	}
++
++      for (i = 0; i < data->cplxcount; i++)
++	if (!obj_pdp11_eval_complex (abfd, info, sec, &data->complexes[i]))
++	  return false;
++
++      data->resolved = true;
++    }
++
++  return true;
++}
++
+ static long
+ obj_pdp11_canonicalize_reloc (bfd *abfd, asection *sec,
+ 			      arelent **relptr,
+@@ -1071,9 +1423,13 @@
+   struct obj_pdp11_section_data *data = obj_section_data (sec);
+   unsigned int i;
+ 
+-  /* Reading the file was fine; using these relocations is not.  What
+-     was skipped was already reported, by kind and by place, when the
+-     file was read -- see obj_pdp11_unsupported.  */
++  /* Reading the file was fine; using these relocations is not.  An
++     entry that could not be read at all was reported by kind and by
++     place when the file was read (see obj_pdp11_unsupported); a complex
++     expression that nobody has worked out yet is reported here, since
++     the place that should have done it is the link
++     (bfd_obj_pdp11_resolve_complex), and whoever is asking is not
++     one.  */
+   if (data != NULL && data->unsupported)
+     {
+       _bfd_error_handler
+@@ -1084,6 +1440,17 @@
+       return -1;
+     }
+ 
++  if (data != NULL && data->cplxcount != 0 && !data->resolved)
++    {
++      _bfd_error_handler
++	/* xgettext:c-format */
++	(_("%pB: %pA carries %u complex relocation expression(s), which only "
++	   "a link can work out"),
++	 abfd, sec, data->cplxcount);
++      bfd_set_error (bfd_error_invalid_operation);
++      return -1;
++    }
++
+   if (data == NULL || data->relocs == NULL)
+     {
+       *relptr = NULL;
+diff -urN a/bfd/obj-pdp11.h b/bfd/obj-pdp11.h
+--- a/bfd/obj-pdp11.h	2026-10-10 19:30:00
++++ b/bfd/obj-pdp11.h	2026-10-10 19:30:00
+@@ -0,0 +1,44 @@
++/* BFD back-end for RT-11 object modules (PDP-11): the parts ld needs.
++   Copyright (C) 2026 Free Software Foundation, Inc.
++
++   This file is part of BFD, the Binary File Descriptor library.
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation; either version 3 of the License, or
++   (at your option) any later version.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program; if not, write to the Free Software
++   Foundation, Inc., 51 Franklin Street - Fifth Floor, Boston,
++   MA 02110-1301, USA.  */
++
++#ifndef OBJ_PDP11_H
++#define OBJ_PDP11_H
++
++/* Work out the complex relocation expressions (RLD entry type 017) ABFD
++   carries, if any, and write their words into the section contents the
++   linker is about to copy out.
++
++   No ELF relocation can stand for one of these -- they are arithmetic
++   over symbols, and a relocation is a symbol plus an addend -- so the
++   linker has to do it here instead, which it can only once every
++   address is final.  Call this from an emulation's finish hook, where
++   sections have their addresses and the link's hash table is still
++   alive; the sections' relocations cannot be read before it has run.
++
++   Returns false, with the reason reported, if an expression cannot be
++   worked out after all: it names an undefined symbol, divides by zero,
++   or the output is relocatable, where the expression would have to be
++   carried over rather than resolved and nothing in ELF can carry it.
++   Does nothing, successfully, to a bfd that is not an obj-pdp11 one.  */
++
++extern bool bfd_obj_pdp11_resolve_complex (bfd *abfd,
++					   struct bfd_link_info *info);
++
++#endif /* OBJ_PDP11_H */
+diff -urN a/bfd/po/SRC-POTFILES.in b/bfd/po/SRC-POTFILES.in
+--- a/bfd/po/SRC-POTFILES.in	2026-10-10 19:30:00
++++ b/bfd/po/SRC-POTFILES.in	2026-10-10 19:30:00
+@@ -338,6 +338,7 @@
+ reloc16.c
+ rs6000-core.c
+ obj-pdp11.c
++obj-pdp11.h
+ sav-pdp11.c
+ sav-pdp11.h
+ section.c
+diff -urN a/ld/emulparams/pdp11rt11.sh b/ld/emulparams/pdp11rt11.sh
+--- a/ld/emulparams/pdp11rt11.sh	2026-10-10 19:30:00
++++ b/ld/emulparams/pdp11rt11.sh	2026-10-10 19:30:00
+@@ -8,6 +8,10 @@
+ # allocated section is "not in segment".
+ SCRIPT_NAME=pdp11rt11
+ TEMPLATE_NAME=elf
++# For the complex relocation expressions an RT-11 object module can
++# carry; the other two rt11 emulations source the same fragment from
++# their own EXTRA_EM_FILE.
++EXTRA_EM_FILE=pdp11rt11cplx
+ OUTPUT_FORMAT="elf32-pdp11"
+ TEXT_START_ADDR=512
+ ARCH=pdp11
+diff -urN a/ld/emultempl/pdp11rt11cplx.em b/ld/emultempl/pdp11rt11cplx.em
+--- a/ld/emultempl/pdp11rt11cplx.em	2026-10-10 19:30:00
++++ b/ld/emultempl/pdp11rt11cplx.em	2026-10-10 19:30:00
+@@ -0,0 +1,72 @@
++# This shell script emits a C file. -*- C -*-
++#   Copyright (C) 2026 Free Software Foundation, Inc.
++#
++# This file is part of the GNU Binutils.
++#
++# This program is free software; you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation; either version 3 of the License, or
++# (at your option) any later version.
++#
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program; if not, write to the Free Software
++# Foundation, Inc., 51 Franklin Street - Fifth Floor, Boston,
++# MA 02110-1301, USA.
++#
++# One hook, finish, for the three pdp11-rt11 emulations: an RT-11 object
++# module among the inputs can carry complex relocation expressions, and
++# this is where they get worked out.  Sourced by the emulations that
++# have an EXTRA_EM_FILE of their own (pdp11rt11sav, pdp11rt11rel) and
++# named as the EXTRA_EM_FILE of the one that does not (pdp11rt11), so
++# that all three behave the same way about them.
++
++fragment <<EOF
++
++/* --- \begin{pdp11rt11cplx.em} */
++#include "obj-pdp11.h"
++
++/* A complex relocation expression (RLD entry type 017 -- arithmetic
++   over symbols, which is what MACRO-11 writes for an expression that
++   goes beyond + and - over a relocatable or external symbol) has no
++   equivalent among ELF relocations: R_PDP11_16 is a symbol plus an
++   addend, with nowhere to put the arithmetic.  So the reader of the
++   format does not turn such an entry into a relocation at all; it keeps
++   the expression, and the work of evaluating it falls here.
++
++   Here, specifically, because this is the first moment when it can be
++   done and the last when it still can.  lang_process() calls
++   ldemul_finish() after lang_size_sections() and the final
++   lang_do_assignments(), so every section has its address and every
++   symbol its value; and it calls it before ldwrite(), so the words this
++   writes into the input sections' contents are still ahead of the copy
++   that puts them in the output.  (The other hook this emulation uses,
++   after_close_output, is far too late -- by then the output bfd is
++   closed and the link's hash table is gone.)
++
++   The reader refuses to hand out a section's relocations until this has
++   run, so a tool that is not a link -- objcopy, say -- cannot quietly
++   produce a file in which the word was never computed.  */
++
++static void
++gld${EMULATION_NAME}_finish (void)
++{
++  bfd *ibfd;
++
++  for (ibfd = link_info.input_bfds; ibfd != NULL; ibfd = ibfd->link.next)
++    if (!bfd_obj_pdp11_resolve_complex (ibfd, &link_info))
++      fatal (_("%P: %pB: cannot work out a complex relocation "
++	       "expression: %E\n"), ibfd);
++
++  ldelf_finish ();
++}
++
++/* --- \end{pdp11rt11cplx.em} */
++
++EOF
++
++LDEMUL_FINISH=gld"$EMULATION_NAME"_finish
+diff -urN a/ld/emultempl/pdp11rt11rel.em b/ld/emultempl/pdp11rt11rel.em
+--- a/ld/emultempl/pdp11rt11rel.em	2026-10-10 19:30:00
++++ b/ld/emultempl/pdp11rt11rel.em	2026-10-10 19:30:00
+@@ -846,3 +846,8 @@
+ EOF
+ 
+ LDEMUL_AFTER_CLOSE_OUTPUT=gld"$EMULATION_NAME"_after_close_output
++
++# The complex-relocation hook, shared with the other two pdp11-rt11
++# emulations; it is what sets LDEMUL_FINISH.
++source_em ${srcdir}/emultempl/pdp11rt11cplx.em
++
+diff -urN a/ld/emultempl/pdp11rt11sav.em b/ld/emultempl/pdp11rt11sav.em
+--- a/ld/emultempl/pdp11rt11sav.em	2026-10-10 19:30:00
++++ b/ld/emultempl/pdp11rt11sav.em	2026-10-10 19:30:00
+@@ -263,3 +263,8 @@
+ '
+ 
+ LDEMUL_AFTER_CLOSE_OUTPUT=gld"$EMULATION_NAME"_after_close_output
++
++# The complex-relocation hook, shared with the other two pdp11-rt11
++# emulations; it is what sets LDEMUL_FINISH.
++source_em ${srcdir}/emultempl/pdp11rt11cplx.em
++
