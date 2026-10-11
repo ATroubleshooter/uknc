@@ -1,0 +1,81 @@
+From: Yury Klushin <digger@live.ru>
+Date: Fri, 10 Oct 2026 19:30:00 +0300
+Subject: [PATCH] Let a p-sect with no text be space, not contents
+
+A p-sect that no TXT record covers is length without content: that is
+what .BLKW writes, and what a C compiler would have called .bss.  This
+reader gave every p-sect a zeroed buffer and told BFD it had contents,
+which for a p-sect of any size is a lie with teeth -- the contents are
+larger than the file they supposedly come from, and
+bfd_get_full_section_contents refuses such a section outright as
+corrupt:
+
+    ld: error: BSS.OBJ(BUFFER) is too large (0x7d0 bytes)
+    ld: final link failed: file truncated
+
+That is a MACRO-11 module with a 1000-word array in it, assembled by
+RT-11's own MACRO, and it could not be linked at all -- the array is
+2000 bytes and the whole object file is 512.
+
+So note whether any text landed in a p-sect, and for one where none
+did, drop SEC_HAS_CONTENTS and SEC_LOAD once the module has been read.
+What was already right stays right: a p-sect with text and a hole in
+the middle (the location counter steps over it, RLD entry type 010)
+keeps its contents, hole and all, since the hole is zeros that belong
+in the image.
+
+The same module now links, and the array costs nothing in the file:
+BUFFER lands after .bss as a section with an address and no contents,
+the image is 1024 bytes rather than 3072, and word 050 of the header
+covers the array exactly (005546 = the end of BUFFER).  Reading DEC's
+SYSLIB.OBJ is unaffected -- its 112 modules have no such p-sect -- and
+every example and test still builds and passes on the machine.
+---
+ bfd/obj-pdp11.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff -urN a/bfd/obj-pdp11.c b/bfd/obj-pdp11.c
+--- a/bfd/obj-pdp11.c	2026-10-10 19:30:00
++++ b/bfd/obj-pdp11.c	2026-10-10 19:30:00
+@@ -185,6 +185,7 @@
+   bfd_byte *contents;
+   arelent *relocs;
+   unsigned int relcount;	/* Counted, then filled.  */
++  bool had_text;		/* Some TXT record landed in this p-sect.  */
+   bool unsupported;		/* Carries an RLD entry we cannot use.  */
+ };
+ 
+@@ -825,6 +826,9 @@
+     {
+       bfd_vma where = bfd_getl16 (body);
+       struct obj_pdp11_section_data *data = obj_section_data (walk->current);
++
++      if (data != NULL && size > 2)
++	data->had_text = true;
+       bfd_byte *contents = data != NULL ? data->contents : NULL;
+       size_t n = size - 2;
+ 
+@@ -945,7 +949,23 @@
+   walk.current = NULL;
+   walk.counting = false;
+   obj_pdp11_walk_records (&walk, buf, size);
++
++  /* A p-sect no TXT record ever covered is length without content --
++     what .BLKW writes, and what a C compiler would have called .bss.
++     Saying it has contents would be a lie with teeth: the contents are
++     bigger than the file they supposedly come from, and
++     bfd_get_full_section_contents refuses such a section outright as
++     corrupt ("is too large"), which is a module that cannot be linked
++     at all.  */
++  for (sec = abfd->sections; sec != NULL; sec = sec->next)
++    {
++      struct obj_pdp11_section_data *data = obj_section_data (sec);
+ 
++      if (data == NULL || data->had_text || sec->size == 0)
++	continue;
++      sec->flags &= ~(SEC_HAS_CONTENTS | SEC_LOAD);
++    }
++
+   free (buf);
+ 
+   abfd->flags |= HAS_SYMS | HAS_RELOC;
