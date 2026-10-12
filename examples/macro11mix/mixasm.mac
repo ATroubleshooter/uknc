@@ -1,0 +1,91 @@
+	.TITLE	MIXASM
+
+; The MACRO-11 half of examples/macro11mix: two routines the C half
+; calls, one it calls back, the table they work on and the room the C
+; half copies it into.
+;
+; The C side's calling convention is all a routine here needs to know.
+; It is pdp11-uknc-rt11-gcc's own, and the compiler obeys it on both
+; sides of a call:
+;
+;   - the arguments go on the stack, right to left, so the first is at
+;     2(SP) on entry, the second at 4(SP), a word apiece;
+;   - the caller takes them off again, so a routine here leaves SP as
+;     it found it;
+;   - the result comes back in R0;
+;   - R0 and R1 are the caller's to lose.  R2 to R5 are not, so what
+;     uses them puts them back.
+;
+; Names are RADIX-50: six characters out of an alphabet of forty, with
+; no lowercase in it.  So every name shared with the C half is spelt in
+; capitals and no longer than six, and the C declarations say so with
+; __asm__ -- see macro11mix.c.
+
+	.GLOBL	CSUM16,EACHWD		; what the C half calls
+	.GLOBL	MIXTAB,MIXCNT,SCRTCH	; what the C half reads and writes
+	.GLOBL	SHOWWD			; what this half calls, in C
+
+	.PSECT	MIXCOD,I,RO
+
+; CSUM16(words, count) -- the one's-complement sum of COUNT words at
+; WORDS: the checksum of DEC's own tapes, and of an IP header.
+;
+; It is here rather than in C because C cannot reach the carry bit, and
+; the carry is the whole idea: what falls off the top of the sum is
+; added back in at the bottom, which is ADC and nothing else.
+
+CSUM16:	MOV	R2,-(SP)	; borrowed below, so put away first
+	MOV	4(SP),R1	; the words
+	MOV	6(SP),R2	; how many of them
+	CLR	R0
+	TST	R2
+	BEQ	20$		; none: the sum of nothing is nothing
+10$:	ADD	(R1)+,R0	; a word of it
+	ADC	R0		; and the carry back in at the bottom
+	SOB	R2,10$
+20$:	MOV	(SP)+,R2
+	RTS	PC
+
+; EACHWD(words, count) -- hand each of the COUNT words at WORDS to
+; SHOWWD, which is in C.  The same convention read from the other side:
+; the argument is pushed, the call is a JSR, and this is the caller now,
+; so it is the one to take the argument off again.
+
+EACHWD:	MOV	R2,-(SP)
+	MOV	R3,-(SP)
+	MOV	6(SP),R2	; the words
+	MOV	10(SP),R3	; how many of them
+	TST	R3
+	BEQ	20$
+10$:	MOV	(R2)+,-(SP)	; the word, as SHOWWD's argument
+	JSR	PC,SHOWWD
+	TST	(SP)+		; and off the stack again
+	SOB	R3,10$		; R2 and R3 are still ours: C put them back
+20$:	MOV	(SP)+,R3
+	MOV	(SP)+,R2
+	RTS	PC
+
+	.PSECT	MIXDAT,D
+
+; The table both halves work on, written here and read there.
+
+MIXTAB:	.WORD	1., 2., 4., 10., 100., 1000., 10000., 32767.
+MIXEND:
+
+MIXLEN	= <MIXEND-MIXTAB>/2	; eight, counted rather than written down
+
+MIXCNT:	.WORD	MIXLEN		; a word, so that C can read it as one:
+				; MIXLEN itself is a number and not a place,
+				; and C has no way to ask for the value of a
+				; symbol that is not at an address
+
+	.PSECT	MIXBSS,D
+
+; Room for the C half to copy the table into and change, so that each
+; half has a turn at storage the other one owns.  .BLKW is space and no
+; contents -- the object module says how much and says nothing about
+; what is in it -- so the .sav does not grow by it.
+
+SCRTCH:	.BLKW	MIXLEN
+
+	.END

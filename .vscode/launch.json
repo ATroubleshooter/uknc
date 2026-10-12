@@ -79,6 +79,36 @@
         },
 
         {
+            // Пример examples/macro11mix собирается в macro11mix.elf, а
+            // половина его кода -- в mixasm.mac: открыв .mac, конфигурация
+            // «отладить открытый пример» искала бы mixasm.elf. Поэтому для
+            // него -- отдельная, с путём целиком. Точки останова ставятся и
+            // в .c, и в .mac.
+            "name": "УКНЦ: отладить examples/macro11mix",
+            "type": "cppdbg",
+            "request": "launch",
+            "preLaunchTask": "Собрать для отладки (ELF)",
+            "program": "${workspaceFolder}/examples/macro11mix/macro11mix.elf",
+            "cwd": "${workspaceFolder}/examples/macro11mix",
+
+            "MIMode": "gdb",
+            "miDebuggerPath": "${workspaceFolder}/gcc/bin/pdp11-uknc-rt11-gdb",
+            "miDebuggerServerAddress": "localhost:2345",
+
+            "debugServerPath": "${workspaceFolder}/debugger/bin/ukncbtldebug",
+            "debugServerArgs": "--disk1 ${workspaceFolder}/resources/rt11os.dsk --rom ${workspaceFolder}/rom/uknc_rom_autoboot.bin --boot --port 2345",
+            "serverStarted": "Listening on localhost",
+            "filterStdout": true,
+            "filterStderr": true,
+
+            "postRemoteConnectCommands": [
+                { "text": "-target-download", "description": "загрузить программу в память машины" }
+            ],
+            "launchCompleteCommand": "exec-continue",
+            "externalConsole": false
+        },
+
+        {
             // Когда машину подняли сами:
             //   ukncbtldebug --disk1 resources/rt11os.dsk \
             //                --rom rom/uknc_rom_autoboot.bin --boot

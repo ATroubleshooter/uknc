@@ -17,6 +17,11 @@ example.dsk
 !resources/rt11os.dsk
 !resources/rt11dev.dsk
 *.ppu
+# What macro11 writes beside a .mac: the RT-11 object module, the ELF
+# file of its line numbers and symbols (-elf), and the listing.
+*.obj
+*.dbg
+*.lst
 /gcc/autotools
 /debugger/bin
 /debugger/src
