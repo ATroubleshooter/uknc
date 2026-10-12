@@ -1,15 +1,23 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-// MAX_N sizes r[], a *stack*-resident array (2 bytes/digit).  crt0 asks the
-// monitor for the top of free memory (.SETTOP) and puts the stack there, so
-// on this project's RT-11 configuration the stack grows down from ~45.6KB
-// toward this program's own ~14KB image, and shares what is between them
-// with the heap -- there's no guard page, so overrunning it silently
-// corrupts the program's own code/data instead of a clean crash. 1500
-// keeps r[] at 3002 bytes, leaving comfortable headroom.
-#define MAX_N 1500
-#define DEFAULT_N 1500
+// MAX_N sizes r[], two bytes to a digit of working precision, and the array
+// is static: it belongs to the program's own memory rather than to the
+// stack.  That is the difference between a size the linker accounts for and
+// one nobody does.  In .bss it is part of the image's memory, counted by the
+// high limit in word 050 of the .sav header, so a program too big to load
+// says so when it is loaded; on the stack the same 6KB would come out of
+// whatever is left between _end and the stack top crt0 gets from .SETTOP
+// (about 31KB here), with no guard page, so overrunning it would quietly
+// corrupt the program rather than fail.
+//
+// The output is not MAX_N digits: this version of the algorithm prints four
+// digits per fourteen of N, so N is the working precision and the digits are
+// about N*2/7 -- 857 of them at 3000.  It is also a long run: 13875 frames,
+// four and a half minutes of machine time, so uknc-run needs a bigger budget
+// than its default (UKNC_FRAMES=15000).
+#define MAX_N 3000
+#define DEFAULT_N 3000
 
 // newlib's printf always pulls in the dtoa/mprec float-formatting machinery
 // on this target -- _printf_float is meant to be a weak symbol so it's only
@@ -54,8 +62,7 @@ static char *ltoa(long num, char *str, int base) {
 int main(int argc, char **argv) {
   // Avoid the default buffered stdio path: it mallocs a 1024-byte BUFSIZ
   // buffer on the first write (our _fstat() doesn't set st_blksize, so
-  // __swhatbuf_r falls back to BUFSIZ) -- on top of r[]'s own footprint,
-  // that would burn through most of the ~4.5KB budget explained above.
+  // __swhatbuf_r falls back to BUFSIZ), and nothing here needs it.
   setvbuf(stdout, NULL, _IONBF, 0);
 
   char buf[20];
@@ -74,7 +81,8 @@ int main(int argc, char **argv) {
   fputs(ltoa(MAX_N, buf, 10), stdout);
   fputs(")\r\n", stdout);
 
-  short r[MAX_N + 1], i, k, b, c;
+  static short r[MAX_N + 1];
+  short i, k, b, c;
   long d;
   c = 0;
   for (i = 1; i <= N; i++)

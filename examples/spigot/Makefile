@@ -1,7 +1,7 @@
 OBJS:=	spigot.o
 SIMH:= pdp11
 CC:=pdp11-uknc-rt11-gcc
-OPT_FLAG:=-O2
+OPT_FLAG:=-O3
 # -ffunction-sections/-fdata-sections put every function and every
 # variable in a section of its own, so that -Wl,--gc-sections below
 # can drop the ones nothing reaches.  Only the ELF toolchain can do
