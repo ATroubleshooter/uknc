@@ -12,30 +12,27 @@ OBJS:=	macro11mix.o mixasm.obj mixasm.dbg
 CC:=pdp11-uknc-rt11-gcc
 M11:=macro11
 OPT_FLAG:=-O2
+# -ffunction-sections/-fdata-sections put every function and every
+# variable in a section of its own, so that -Wl,--gc-sections below can
+# drop the ones nothing reaches.
+SECTION_FLAGS:=-ffunction-sections -fdata-sections
 # -g is what puts DWARF in the C objects; -elf below does the same for
 # the MACRO-11 one.
-GCC_FLAGS:=-std=gnu23 -fomit-frame-pointer $(OPT_FLAG) -g
+GCC_FLAGS:=-std=gnu23 -fomit-frame-pointer $(OPT_FLAG) $(SECTION_FLAGS) -g
 
-# No -ffunction-sections/-fdata-sections and no --gc-sections here,
-# which every other example in this directory does use.  Collecting
-# what nothing reaches works by following relocations, and it follows
-# them only through ELF objects, which has two consequences for a
-# program with a MACRO-11 half in it:
-#
-#   - the call this one's EACHWD makes to SHOWWD, a C function, is in
-#     an RT-11 object module, so that walk never sees it.  Nothing else
-#     calls SHOWWD, its section would go, and what is left is a JSR into
-#     whatever ended up at that address instead.  -Wl,-u,SHOWWD would
-#     answer that one, and every other C name only the MACRO-11 half
-#     uses would need the same;
-#   - mixasm.dbg would go entirely.  The linker keeps an input file's
-#     debug sections only when some section of that same file is kept,
-#     and a file that is nothing but debug information has none to keep
-#     -- so the MACRO-11 half's line numbers, the point of this
-#     example, would be collected and no one would say so.
-#
-# Both are worth knowing about before turning it on elsewhere.
-LD_FLAGS:=
+# Collecting what nothing reaches wanted two things of the linker before
+# a program built like this one could use it, and both are in
+# patches/binutils/0022.  The collection follows relocations, and it
+# follows them only through ELF objects: the call this program's EACHWD
+# makes to SHOWWD is in an RT-11 object module, nothing else calls that
+# function, and so its section went -- leaving a JSR into whatever took
+# its place, with no diagnostic.  And an input file's debug sections are
+# kept only when some section of that same file is kept, which a file
+# that is nothing but debug information never has, so mixasm.dbg went
+# whole and the MACRO-11 half's line numbers with it.  Now a symbol a
+# module in another format leaves undefined is a root, and a file with
+# no allocatable section keeps its DWARF.
+LD_FLAGS:=-Wl,--gc-sections
 
 # The ELF with it, not only the disk image: the symbols are the point
 # of this example, and the .sav has nowhere to keep them.

@@ -1,0 +1,193 @@
+From: Yury Klushin <digger@live.ru>
+Date: Sun, 12 Oct 2026 04:10:00 +0300
+Subject: [PATCH] Collect sections without losing what an RT-11 module needs
+
+Collecting sections kept neither what an RT-11 object module refers to
+nor the file that says where its lines are.  Both are needed to build a
+program whose halves are in different languages -- which these targets
+can, ld reading an RT-11 object module as readily as an ELF one (bfd's
+obj-pdp11) -- and neither failure said anything.
+
+The first: --gc-sections works out what is reachable by following
+relocations, and it follows them only through ELF objects, the marking
+being done with ELF internal relocations.  An RT-11 object module's
+relocations are not those, so what such a file refers to was invisible.
+A C function called only from the MACRO-11 half of a program had its
+section collected, and the relocation in the module was then against a
+symbol with no section -- which is given zero, so the JSR went to
+whatever followed it.  The program hung, and nothing in the link had
+said a word.  -Wl,-u,NAME answered it one name at a time, for anyone who
+knew to.
+
+What a file refers to is what it leaves undefined, and that much is
+plain to read whatever the format.  So bfd_elf_gc_sections now keeps
+every symbol a non-ELF input leaves undefined, exactly as --undefined
+keeps one, right where it already keeps the symbols of --undefined
+itself (bed->gc_keep).
+
+The second: an input file's debug sections are kept only when some
+allocatable section of that same file is kept, which is right for an
+object whose code was collected -- its line numbers describe nothing
+now -- and wrong for a file that never had code in it.  macro11's -elf
+writes exactly such a file: the line numbers and symbols of a MACRO-11
+module as DWARF, to be linked beside the object module that holds the
+code (see patches/macro11/0002).  It has no allocatable section to keep,
+so every --gc-sections link threw all of it away and the MACRO-11 half
+of a program lost its line numbers.
+
+So the test is now whether the file had an allocatable section at all:
+when it had none, nothing of it has been discarded and its debug
+information describes code that is still there.
+
+Checked: examples/macro11mix (C calling MACRO-11 and MACRO-11 calling
+back into C) links with --gc-sections and -ffunction-sections, runs on
+the machine, and addr2line maps the addresses of both halves to their
+own source lines -- where before the C function the assembler called was
+gone and the MACRO-11 line table with it.  Collecting still collects:
+that program's image is 10752 bytes with --gc-sections and 13824
+without, and the debug sections of library members nothing reaches are
+dropped as they were (55 sections in that link).  And nothing changes
+for a program that is all ELF: examples/hello and examples/sin come out
+byte for byte identical, .sav and .elf alike, to a build with the
+linker as it was.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ bfd/elflink.c | 94 +++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 92 insertions(+), 2 deletions(-)
+
+diff -urN a/bfd/elflink.c b/bfd/elflink.c
+--- a/bfd/elflink.c	2026-10-12 04:10:00
++++ b/bfd/elflink.c	2026-10-12 04:10:00
+@@ -14257,6 +14257,7 @@
+     {
+       asection *isec;
+       bool some_kept;
++      bool some_alloc;
+       bool debug_frag_seen;
+       bool has_kept_debug_info;
+ 
+@@ -14270,8 +14271,13 @@
+ 	 see if any other section is already marked,
+ 	 and note if we have any fragmented debug sections.  */
+       debug_frag_seen = some_kept = has_kept_debug_info = false;
++      some_alloc = false;
+       for (isec = ibfd->sections; isec != NULL; isec = isec->next)
+ 	{
++	  if ((isec->flags & (SEC_ALLOC | SEC_LINKER_CREATED)) == SEC_ALLOC
++	      && elf_section_type (isec) != SHT_NOTE)
++	    some_alloc = true;
++
+ 	  if ((isec->flags & SEC_LINKER_CREATED) != 0)
+ 	    isec->gc_mark = 1;
+ 	  else if (isec->gc_mark
+@@ -14316,8 +14322,16 @@
+ 	}
+ 
+       /* If no non-note alloc section in this file will be kept, then
+-	 we can toss out the debug and special sections.  */
+-      if (!some_kept)
++	 we can toss out the debug and special sections -- unless the
++	 file had no such section to begin with, in which case nothing
++	 of it has been discarded and its debug information describes
++	 code that is still there.  That is a file written to carry
++	 debug information and nothing else, which is how the line
++	 numbers of a module in another format can reach an ELF link:
++	 for the pdp11-rt11 targets, macro11's -elf writes the line
++	 numbers and symbols of a MACRO-11 module as DWARF beside the
++	 RT-11 object module that holds its code.  */
++      if (!some_kept && some_alloc)
+ 	continue;
+ 
+       /* Keep debug and special sections like .comment when they are
+@@ -14644,7 +14658,77 @@
+ }
+ 
+ /* Do mark and sweep of unused sections.  */
++
++/* An input file that is not ELF -- an RT-11 object module among ELF
++   objects, say, which the pdp11-rt11 targets link -- has relocations of
++   its own, and the marking below cannot read them: it works through ELF
++   internal relocations.  So whatever such a file refers to is invisible
++   to the collection, and a function reached only from there would be
++   thrown away.  Worse, silently: the relocation in that file is then
++   against a symbol whose section has gone, and what it is given is
++   zero.
++
++   What a file refers to is what it leaves undefined, and that is plain
++   to read in any format.  So every symbol a non-ELF input leaves
++   undefined is kept, exactly as --undefined would keep it.  */
++
++static bool
++elf_gc_keep_non_elf_refs (struct bfd_link_info *info)
++{
++  bfd *sub;
++
++  for (sub = info->input_bfds; sub != NULL; sub = sub->link.next)
++    {
++      long symsize;
++      long symcount;
++      long i;
++      asymbol **syms;
++
++      if (bfd_get_flavour (sub) == bfd_target_elf_flavour
++	  || (sub->flags & DYNAMIC) != 0
++	  || (bfd_get_file_flags (sub) & HAS_SYMS) == 0)
++	continue;
++
++      symsize = bfd_get_symtab_upper_bound (sub);
++      if (symsize < 0)
++	return false;
++      if (symsize == 0)
++	continue;
++
++      syms = (asymbol **) bfd_malloc (symsize);
++      if (syms == NULL)
++	return false;
++
++      symcount = bfd_canonicalize_symtab (sub, syms);
++      if (symcount < 0)
++	{
++	  free (syms);
++	  return false;
++	}
++
++      for (i = 0; i < symcount; i++)
++	{
++	  struct elf_link_hash_entry *h;
++
++	  if (!bfd_is_und_section (syms[i]->section))
++	    continue;
++
++	  h = elf_link_hash_lookup (elf_hash_table (info), syms[i]->name,
++				    false, false, true);
++	  if (h != NULL
++	      && (h->root.type == bfd_link_hash_defined
++		  || h->root.type == bfd_link_hash_defweak)
++	      && !bfd_is_abs_section (h->root.u.def.section)
++	      && !bfd_is_und_section (h->root.u.def.section))
++	    h->root.u.def.section->flags |= SEC_KEEP;
++	}
++
++      free (syms);
++    }
+ 
++  return true;
++}
++
+ bool
+ bfd_elf_gc_sections (bfd *abfd, struct bfd_link_info *info)
+ {
+@@ -14663,6 +14747,12 @@
+     }
+ 
+   bed->gc_keep (info);
++
++  /* And what an input in another format refers to, which the marking
++     below would not see.  */
++  if (!elf_gc_keep_non_elf_refs (info))
++    return false;
++
+   htab = elf_hash_table (info);
+ 
+   /* Try to parse each bfd's .eh_frame section.  Point elf_eh_frame_section
