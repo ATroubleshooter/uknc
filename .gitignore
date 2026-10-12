@@ -17,6 +17,10 @@ example.dsk
 !resources/rt11os.dsk
 !resources/rt11dev.dsk
 *.ppu
+# Сырой вывод измерителя в tests/float-fis.
+out_*.txt
+perop.txt
+
 # What macro11 writes beside a .mac: the RT-11 object module, the ELF
 # file of its line numbers and symbols (-elf), and the listing.
 *.obj
