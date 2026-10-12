@@ -1,0 +1,33 @@
+# hello — самая маленькая программа
+
+`puts()` в консоль и выход. Нужна, чтобы проверить, что тулчейн собран, что
+`.sav` грузится и что стандартная библиотека на машине работает: это тот самый
+пример, который сборка в GitHub Actions собирает перед упаковкой и прогоняет
+на машине, сверяя вывод.
+
+## Сборка и запуск
+
+```bash
+make                            # hello.sav и hello.dsk
+make hello.elf                  # то же самое с символами и DWARF — для gdb
+../../gcc/dejagnu/uknc-run hello.sav
+```
+
+Или загрузить образ диска в эмуляторе и набрать `RUN HELLO` в RT-11:
+
+```bash
+../../debugger/bin/ukncbtldebug --disk1 hello.dsk \
+    --rom ../../rom/uknc_rom_autoboot.bin --boot --screen
+```
+
+## Что в нём смотреть
+
+Собирается тем же набором флагов, что и остальные примеры: `-O2
+-fomit-frame-pointer`, `-ffunction-sections -fdata-sections` плюс
+`-Wl,--gc-sections`, чтобы линкер выбросил из библиотеки всё, до чего
+программа не дотягивается, и `-g` — на `.sav` отладочная информация не влияет
+(секции не `ALLOC`), она нужна только в `.elf`.
+
+Рядом с `Makefile` лежит `CMakeLists.txt` — тот же пример через CMake
+(`uknc_add_program`/`uknc_add_disk`/`uknc_add_run`, см. раздел про CMake в
+README проекта); обе сборки дают байт в байт одно и то же.

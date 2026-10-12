@@ -12,19 +12,14 @@
  *
  * Both halves are debugged the same way, which is the other thing this
  * example is for: -g puts DWARF in the C objects, -elf puts it beside
- * the object module, and the Makefile links an ELF with the lot.  gdb
- * then steps from main() into CSUM16 by MACRO-11 source line, and
- * addr2line names an address in either half:
- *
- *   (gdb) break mixasm.mac:43
- *   Breakpoint 1 at 0x3408: file mixasm.mac, line 43.
- *   (gdb) bt
- *   #0  SHOWWD (word=1) at macro11mix.c:42
- *   #1  EACHWD () at mixasm.mac:61
- *
- * -- a backtrace across the join.  It stops at the MACRO-11 frame and
- * does not reach main(): hand-written code carries no call-frame
- * information, and gdb has nothing to unwind by.
+ * the object module, and the Makefile links an ELF with the lot.  So
+ * addr2line names an address in either half, `break mixasm.mac:43'
+ * stops inside CSUM16's loop and `step' walks the assembler a line at a
+ * time; and at a breakpoint in SHOWWD the backtrace crosses the join --
+ * frame 0 here in the C, frame 1 the line of mixasm.mac that made the
+ * call.  It stops there and does not reach main(): hand-written code
+ * carries no call-frame information, and gdb has nothing to unwind by.
+ * README.md beside this file has the rest.
  */
 
 #include <stdio.h>
