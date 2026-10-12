@@ -303,6 +303,17 @@ cp rt11dsk ${BUILDDIR}/bin/rt11dsk
 # (obj-pdp11, see bfd/obj-pdp11.c), so a module assembled here links
 # with ELF objects like any other input.
 #
+# Patched, as everything else here is, from patches/macro11: 0001 is a
+# build fix, 0002 is this project's own -elf, which writes the module's
+# line numbers and symbols as DWARF in an ELF file beside the object
+# module.  Link the two and a .MAC module debugs like a .c one -- gdb
+# steps it a source line at a time and addr2line names its addresses,
+# which is also what makes a MACRO-11 module show up in a profile (see
+# debugger/prof2cpuprofile.py).  0002 is the same change as the
+# elf_symbols branch of wdigger/macro11, over the 0.9 release rather
+# than over that fork's master; the two differ only in a Makefile
+# unrelated to it.
+#
 # Not prefixed pdp11-uknc-rt11-, for the same reason rt11dsk above is
 # not: it is a program of its own rather than one of a cross toolchain's
 # matched set.
