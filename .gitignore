@@ -20,6 +20,7 @@ example.dsk
 # Сырой вывод измерителя в tests/float-fis.
 out_*.txt
 perop.txt
+sweep.txt
 
 # What macro11 writes beside a .mac: the RT-11 object module, the ELF
 # file of its line numbers and symbols (-elf), and the listing.
