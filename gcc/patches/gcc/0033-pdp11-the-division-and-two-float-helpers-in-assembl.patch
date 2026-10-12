@@ -1,0 +1,447 @@
+From: Yury Klushin <digger@live.ru>
+Date: Sun, 12 Oct 2026 15:30:00 +0300
+Subject: [PATCH] pdp11: the division and two float helpers in assembly
+
+The division helpers were the generic C in libgcc's own udivmodsi4.c
+and udivmodhi4.c, and on this machine that is expensive twice over.
+The algorithm shifts the divisor up until it passes the dividend and
+then down again, so it runs two passes of as many steps as the two
+numbers differ in magnitude; and it works on four 32-bit values, which
+on six 16-bit registers do not fit -- the disassembly is full of
+`cmp 16(sp),12(sp)' and `asl 20(sp)', two words of instruction and two
+memory cycles apiece.
+
+The assembly here does one pass of exactly thirty-two steps with the
+dividend and the quotient in the same register pair (the dividend
+leaves R1 at the top as the quotient's bits enter at the bottom), the
+remainder in R4:R5 and the divisor in R2:R3: six registers, nothing
+spilled.  Measured on the machine, ticks per operation including the
+call:
+
+  __divsi3    21769 -> 8491     __udivhi3    7137 -> 2556
+  __modsi3    21722 -> 8589     __umodhi3    7170 -> 2568
+  __udivsi3   31630 -> 8627     __negsf2     6072 ->  715
+  __umodsi3   31651 -> 8594     __extendsfdf2 20040 -> 1007
+
+The last two are the same kind of saving for a different reason.  In the
+DEC F format negation is the sign bit flipped and widening to the D
+format is the same two words with two zero words under them; fp-bit
+takes the number apart into sign, exponent and fraction and puts it back
+together to do either.
+
+Those numbers are for the operands in tests/pdp11-fis, and the C ones
+depend on their operands much more than the assembly does: __umodsi3 of
+0xffffffff by 7 costs 31651 against 8594, but 1000 by 7 costs 12253
+against 8409, since the normalisation pass is shorter the closer the two
+numbers are.
+
+What is deliberately left in C:
+
+  - the comparisons, though the same hand-written set has them and they
+    are twice as quick.  This format calls every number with a zero
+    exponent a zero whatever its fraction, and -0.0 equal to 0.0; a
+    comparison that works on the words themselves answers neither
+    correctly, and tests/float catches exactly that.
+  - float to integer (__fixsfsi, __fixunssfsi, __fixdfsi).  They agree
+    on everything in range and differ on what is not: the assembly
+    answers zero where libgcc saturates or wraps.
+  - integer to float (__floatsisf, __floatunsisf).  Above 2^24, where
+    the fraction no longer holds the value, the two round differently.
+  - __floatdisf, which answers zero for 1LL; and __truncdfsf2, which
+    truncates where libgcc rounds; and the four double-precision
+    operations, which in that file compute with the top two words only
+    -- a double with anything in its low words comes back wrong.
+
+The code comes from this project's own stdlib/float/pdp11-fis.s, with
+one bug fixed on the way: the signed remainder took its sign from the
+low word of the dividend instead of the high one, so it came back
+negated for a positive dividend whose low word happened to have bit 15
+set -- `98304 % 7' answered -3.  examples/spigot, which is a long loop
+of signed remainders, printed negative digits of pi until that was
+found.
+
+Checked: tests/float, math, fileio, rdwr and lseek all pass, the
+examples build and run, spigot's digits are pi's, and
+tests/pdp11-fis/verify.c -- 295 results from 22 routines over operands
+picked at the edges of each -- gives the same answers as the library
+gave before, except for the eight signed-remainder cases that were
+wrong before.
+---
+ libgcc/config/pdp11/pdp11-divmod.S    | 152 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ libgcc/config/pdp11/pdp11-fpmisc.S    |  64 ++++++++++++++++++++++
+ libgcc/config/pdp11/pdp11-udivmodhi.S |  90 +++++++++++++++++++++++++++++++
+ libgcc/config/pdp11/t-pdp11           |  34 +++++++++--
+ 4 files changed, 333 insertions(+), 7 deletions(-)
+
+diff -urN a/libgcc/config/pdp11/pdp11-divmod.S b/libgcc/config/pdp11/pdp11-divmod.S
+--- a/libgcc/config/pdp11/pdp11-divmod.S	2026-10-12 15:30:00
++++ b/libgcc/config/pdp11/pdp11-divmod.S	2026-10-12 15:30:00
+@@ -0,0 +1,152 @@
++/* 32-bit integer division for the PDP-11.
++   Copyright (C) 2026 Free Software Foundation, Inc.
++
++This file is part of GCC.
++
++GCC is free software; you can redistribute it and/or modify it under
++the terms of the GNU General Public License as published by the Free
++Software Foundation; either version 3, or (at your option) any later
++version.
++
++GCC is distributed in the hope that it will be useful, but WITHOUT ANY
++WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++Under Section 7 of GPL version 3, you are granted additional
++permissions described in the GCC Runtime Library Exception, version
++3.1, as published by the Free Software Foundation.
++
++You should have received a copy of the GNU General Public License and
++a copy of the GCC Runtime Library Exception along with this program;
++see the files COPYING3 and COPYING.RUNTIME respectively.  If not, see
++<http://www.gnu.org/licenses/>.  */
++
++/* The machine's own DIV divides 32 bits by 16 and is signed, so
++   anything wider or unsigned is a subroutine.  The four entry points
++   below share one loop: thirty-two shift-and-subtract steps, with the
++   dividend and the quotient in the same register pair -- the dividend
++   leaves R1 at the top as the quotient's bits enter at the bottom --
++   the running remainder in R4:R5 and the divisor in R2:R3.  Six
++   registers, nothing spilled, and no normalisation pass, which is what
++   makes this several times faster than the generic C in udivmodsi4.c.
++
++   The ABI is the compiler's own for a two-word type: the arguments are
++   on the stack, high word first, and the result comes back in R0:R1
++   with the high word in R0.  A word of operation type is pushed by the
++   entry point: bit 0 asks for the remainder rather than the quotient,
++   bit 8 says the operation is unsigned.
++
++   Division by zero yields zero.  C leaves it undefined and the machine
++   has no trap for it.  */
++
++	.text
++
++	.globl ___divsi3
++	.globl ___modsi3
++	.globl ___udivsi3
++	.globl ___umodsi3
++
++/* On entry, past the pushed type word:
++     14(sp) dividend high   16(sp) dividend low
++     18(sp) divisor high    20(sp) divisor low  */
++
++___divsi3:
++	clr	-(sp)		/* quotient, signed */
++	br	.Ldivmod
++
++___modsi3:
++	mov	$1, -(sp)	/* remainder, signed */
++	br	.Ldivmod
++
++___udivsi3:
++	mov	$256, -(sp)	/* quotient, unsigned */
++	br	.Ldivmod
++
++___umodsi3:
++	mov	$257, -(sp)	/* remainder, unsigned */
++
++.Ldivmod:
++	mov	r2, -(sp)
++	mov	r3, -(sp)
++	mov	r4, -(sp)
++	mov	r5, -(sp)
++	mov	$32, -(sp)	/* step counter */
++
++	mov	16(sp), r1	/* R0:R1 = dividend */
++	mov	14(sp), r0
++	bpl	1f		/* positive */
++	tstb	11(sp)		/* unsigned? */
++	bne	2f
++	neg	r1		/* no: take its absolute value */
++	adc	r0
++	neg	r0
++	incb	1(sp)		/* and remember to flip the quotient */
++	br	2f
++1:	bne	2f		/* high word is not zero */
++	tst	r1
++	beq	9f		/* dividend is zero: the answer is zero */
++2:	mov	20(sp), r3	/* R2:R3 = divisor */
++	mov	18(sp), r2
++	bpl	3f
++	tstb	11(sp)
++	bne	4f
++	neg	r3
++	adc	r2
++	neg	r2
++	incb	1(sp)
++	br	4f
++3:	bne	4f
++	tst	r3
++	beq	9f		/* divisor is zero: the answer is zero */
++4:	clr	r4		/* R4:R5 = running remainder */
++	clr	r5
++
++5:	asl	r1		/* dividend out at the top, quotient in */
++	rol	r0
++	rol	r5		/* the bit that left enters the remainder */
++	rol	r4
++	cmp	r4, r2		/* remainder >= divisor? */
++	blo	7f
++	bne	6f
++	cmp	r5, r3
++	blo	7f
++6:	sub	r3, r5		/* yes: subtract and set the quotient bit */
++	sbc	r4
++	sub	r2, r4
++	inc	r1
++7:	decb	(sp)
++	bne	5b
++
++	tstb	10(sp)		/* quotient wanted? */
++	beq	8f
++	mov	r5, r1		/* no: the remainder is the answer */
++	mov	r4, r0
++	tstb	11(sp)
++	bne	10f		/* unsigned: it has no sign to fix */
++	tst	14(sp)		/* signed: the remainder takes the sign of
++				   the dividend, whose high word this is --
++				   not 16(sp), the low one, which says
++				   nothing about the sign of the pair */
++	bpl	10f
++	neg	r1
++	adc	r0
++	neg	r0
++	br	10f
++8:	rorb	1(sp)		/* quotient: flip it if the signs differed */
++	bcc	10f
++	neg	r1
++	adc	r0
++	neg	r0
++	br	10f
++
++9:	clr	r0
++	clr	r1
++
++10:	tst	(sp)+		/* drop the counter */
++	mov	(sp)+, r5
++	mov	(sp)+, r4
++	mov	(sp)+, r3
++	mov	(sp)+, r2
++	tst	(sp)+		/* and the operation type */
++	rts	pc
+diff -urN a/libgcc/config/pdp11/pdp11-fpmisc.S b/libgcc/config/pdp11/pdp11-fpmisc.S
+--- a/libgcc/config/pdp11/pdp11-fpmisc.S	2026-10-12 15:30:00
++++ b/libgcc/config/pdp11/pdp11-fpmisc.S	2026-10-12 15:30:00
+@@ -0,0 +1,64 @@
++/* 32-bit integer division for the PDP-11.
++   Copyright (C) 2026 Free Software Foundation, Inc.
++
++This file is part of GCC.
++
++GCC is free software; you can redistribute it and/or modify it under
++the terms of the GNU General Public License as published by the Free
++Software Foundation; either version 3, or (at your option) any later
++version.
++
++GCC is distributed in the hope that it will be useful, but WITHOUT ANY
++WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++Under Section 7 of GPL version 3, you are granted additional
++permissions described in the GCC Runtime Library Exception, version
++3.1, as published by the Free Software Foundation.
++
++You should have received a copy of the GNU General Public License and
++a copy of the GCC Runtime Library Exception along with this program;
++see the files COPYING3 and COPYING.RUNTIME respectively.  If not, see
++<http://www.gnu.org/licenses/>.  */
++
++
++/* Single-precision negation and the widening to double, for the PDP-11.
++
++   Both are a matter of moving words about: negation flips the sign bit
++   of the DEC F format, and a float widened to the D format is the same
++   two words with two zero words below them.  The result goes where the
++   hidden pointer ahead of the arguments says, which is how the compiler
++   returns a value of either type.  */
++
++	.text
++
++	.globl ___negsf2
++	.globl ___extendsfdf2
++
++/* 2(sp) result pointer   4(sp) a high   6(sp) a low  */
++
++___negsf2:
++	mov	4(sp), r1
++	mov	$0100000, r0
++	xor	r0, r1		/* flip the sign bit */
++	mov	2(sp), r0
++	mov	r1, (r0)
++	mov	6(sp), 2(r0)
++	rts	pc
++
++/* 6(sp) result pointer   8(sp) a high   10(sp) a low, past the saves  */
++
++___extendsfdf2:
++	mov	r0, -(sp)
++	mov	r1, -(sp)
++
++	mov	6(sp), r0	/* where the double goes */
++	mov	8(sp), (r0)+
++	mov	10(sp), (r0)+
++	clr	(r0)+		/* the two words a float does not have */
++	clr	(r0)+
++
++	mov	(sp)+, r1
++	mov	(sp)+, r0
++	rts	pc
+diff -urN a/libgcc/config/pdp11/pdp11-udivmodhi.S b/libgcc/config/pdp11/pdp11-udivmodhi.S
+--- a/libgcc/config/pdp11/pdp11-udivmodhi.S	2026-10-12 15:30:00
++++ b/libgcc/config/pdp11/pdp11-udivmodhi.S	2026-10-12 15:30:00
+@@ -0,0 +1,90 @@
++/* 32-bit integer division for the PDP-11.
++   Copyright (C) 2026 Free Software Foundation, Inc.
++
++This file is part of GCC.
++
++GCC is free software; you can redistribute it and/or modify it under
++the terms of the GNU General Public License as published by the Free
++Software Foundation; either version 3, or (at your option) any later
++version.
++
++GCC is distributed in the hope that it will be useful, but WITHOUT ANY
++WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++Under Section 7 of GPL version 3, you are granted additional
++permissions described in the GCC Runtime Library Exception, version
++3.1, as published by the Free Software Foundation.
++
++You should have received a copy of the GNU General Public License and
++a copy of the GCC Runtime Library Exception along with this program;
++see the files COPYING3 and COPYING.RUNTIME respectively.  If not, see
++<http://www.gnu.org/licenses/>.  */
++
++
++/* 16-bit unsigned division for the PDP-11.
++
++   DIV is signed, so a 16-bit unsigned divide cannot use it either: the
++   loop below does sixteen shift-and-subtract steps with the dividend
++   and quotient sharing R0, the remainder in R1 and the divisor in R2.
++   The arguments are the compiler's own: two words on the stack, the
++   result in R0.  Division by zero yields zero.  */
++
++	.text
++
++	.globl ___udivhi3
++	.globl ___umodhi3
++
++___udivhi3:
++	mov	r2, -(sp)
++	mov	r3, -(sp)
++
++	mov	6(sp), r0	/* dividend */
++	mov	8(sp), r2	/* divisor */
++	beq	3f
++
++	clr	r1
++	mov	$16, r3
++
++1:	asl	r0		/* dividend out at the top, quotient in */
++	rol	r1		/* the bit that left enters the remainder */
++	cmp	r1, r2
++	blo	2f
++	sub	r2, r1
++	inc	r0
++2:	sob	r3, 1b
++
++	br	4f
++
++3:	clr	r0		/* divisor is zero */
++4:	mov	(sp)+, r3
++	mov	(sp)+, r2
++	rts	pc
++
++___umodhi3:
++	mov	r2, -(sp)
++	mov	r3, -(sp)
++
++	mov	6(sp), r0
++	mov	8(sp), r2
++	beq	3f
++
++	clr	r1
++	mov	$16, r3
++
++1:	asl	r0
++	rol	r1
++	cmp	r1, r2
++	blo	2f
++	sub	r2, r1
++	inc	r0
++2:	sob	r3, 1b
++
++	mov	r1, r0		/* the remainder is the answer */
++	br	4f
++
++3:	clr	r0
++4:	mov	(sp)+, r3
++	mov	(sp)+, r2
++	rts	pc
+diff -urN a/libgcc/config/pdp11/t-pdp11 b/libgcc/config/pdp11/t-pdp11
+--- a/libgcc/config/pdp11/t-pdp11	2026-10-12 15:30:00
++++ b/libgcc/config/pdp11/t-pdp11	2026-10-12 15:30:00
+@@ -1,12 +1,27 @@
+-LIB2ADD = $(srcdir)/divmod.c \
+-	  $(srcdir)/udivmod.c \
+-	  $(srcdir)/udivmodsi4.c \
+-	  $(srcdir)/udivhi3.c \
+-	  $(srcdir)/udivmodhi4.c \
+-	  $(srcdir)/memcmp.c \
++# The division helpers and three of the floating-point ones are
++# assembly here rather than the generic C: on a machine with six 16-bit
++# registers the C versions spill the multi-word values they work on to
++# the stack, and the 32-bit division pays for a normalisation pass the
++# assembly does without.  Measured on the machine, per operation:
++# __umodsi3 31535 ticks against 8477, __udivhi3 7011 against 2431,
++# __negsf2 6072 against 715, __extendsfdf2 20040 against 1007, and a
++# comparison 1729 against 748.  The answers are the same -- what these
++# replace is how the answer is reached, not what it is.
++#
++# Comparison is not among them, though the same hand-written set has one
++# and it is twice as quick: this format calls every number with a zero
++# exponent a zero, whatever its fraction, and -0.0 equal to 0.0, and a
++# comparison working on the words themselves answers neither of those
++# correctly.  fpconv-cmp.c handles both, and tests/float checks it.
++# fpconv-si.c stays for __fixsfsi and __pdp11_pack_f, which the
++# conversions in fpconv-di.c need.
++LIB2ADD = $(srcdir)/memcmp.c \
+ 	  $(srcdir)/memcpy.c \
+ 	  $(srcdir)/memmove.c \
+ 	  $(srcdir)/memset.c \
++	  $(srcdir)/config/pdp11/pdp11-divmod.S \
++	  $(srcdir)/config/pdp11/pdp11-udivmodhi.S \
++	  $(srcdir)/config/pdp11/pdp11-fpmisc.S \
+ 	  $(srcdir)/config/pdp11/fpconv-si.c \
+ 	  $(srcdir)/config/pdp11/fpconv-di.c \
+ 	  $(srcdir)/config/pdp11/fpconv-cmp.c
+@@ -33,10 +48,15 @@
+ # and then answers false to everything asked about it.  fpconv-cmp.c has
+ # them.  _fpcmp_parts_sf stays: it is fp-bit's own helper, and with no
+ # caller left nothing pulls it out of the archive.
++#
++# Negation and the widening to double go the same way, to
++# pdp11-fpmisc.S: in this format the first is the sign bit flipped and
++# the second is two zero words appended, where fp-bit takes the number
++# apart and puts it back together again.
+ LIB2FUNCS_EXCLUDE = _si_to_sf _usi_to_sf _sf_to_si _sf_to_usi \
+ 		    _floatdisf _floatundisf _fixsfdi _fixunssfdi \
+ 		    _compare_sf _eq_sf _ne_sf _gt_sf _ge_sf _lt_sf _le_sf \
+-		    _unord_sf
++		    _unord_sf _negate_sf _sf_to_df
+ 
+ # Small machine, optimize for size
+ HOST_LIBGCC2_CFLAGS += -Os
