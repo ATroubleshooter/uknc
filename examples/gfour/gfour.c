@@ -2,63 +2,48 @@
 // 320x288 screen until any key is pressed (or NUM_FRAMES elapses with
 // none, as a safety cap for an unattended run), then exits.
 //
-// The first real graphics output in this project: the video
-// generator's plane 0 (tag list, palette, horizontal scale) is
-// entirely PPU-owned (see gfourppu.c). Pixel data lives in an ordinary
-// malloc()ed buffer of this program's own (`screen` below), written
-// through a plain pointer: the CPU's whole RAM *is* video planes 1/2
-// interleaved (CPU byte 2N = plane1[N], 2N+1 = plane2[N] -- confirmed
-// against ukncbtl's emubase/Memory.cpp, ADDRTYPE_RAM12 for every
-// address below 0160000), and the PPU's tag list can point a scanline
-// at any plane offset at all, so the buffer's address / 2 is all the
-// PPU needs to display it -- sent over once, right after ppuc_run()
-// (see main()). Two shipped UKNC games do exactly this
-// (blairecas/bolder, aberranthacker/soft_scroll_test), and so does
-// this project's own Digger port, where it replaced the version of
-// this scheme this file used first: pixels in RT-11's own console
-// screen memory at plane offset 0100000 -- above the CPU's directly
-// addressable range -- reached one word at a time through the
-// address/data window ports 0176640/0176642, two I/O writes (and, for
-// a read-modify-write, a read) per word. The ports are gone from this
-// file now; gfourppu.c's header comment keeps the account of that
-// address.
+// The video generator's plane 0 (tag list, palette, horizontal scale)
+// is entirely PPU-owned (see gfourppu.c). Pixel data lives in an
+// ordinary malloc()ed buffer of this program's own (`screen` below),
+// written through a plain pointer: the CPU's whole RAM *is* video
+// planes 1/2 interleaved (CPU byte 2N = plane1[N], 2N+1 = plane2[N],
+// for every address below 0160000), and the PPU's tag list can point a
+// scanline at any plane offset at all, so the buffer's address / 2 is
+// all the PPU needs to display it -- sent over once, right after
+// ppuc_run() (see main()).
 //
-// Digger has to split its screen (HUD through the ports, playfield in
-// a heap buffer) and move its stack out of the way; this program is
-// small enough that the full 288-line buffer (23040 bytes) fits between
-// its own _end and the stack RT-11 gave it, so none of that is needed
-// here.
+// The whole 288-line buffer is 23040 bytes, and it fits between this
+// program's own _end and the stack RT-11 gave it. A program that needs
+// more than is left there has to put its pixels somewhere else: RT-11's
+// own console screen memory, at plane offset 0100000, is outside the
+// CPU's address space and reached a word at a time through the
+// address/data window ports 0176640/0176642 -- see examples/sin, which
+// does exactly that because it has no room for a buffer of its own.
 //
 // Keypresses reach this side via libppu's own channel-1 PPU->CPU
-// messaging (ppuc_recv_init(), see ppu_client.h) instead of any kind
-// of polling: gfourppu.c's own keyboard interrupt handler (see its
-// header comment) forwards raw scancodes as they happen, and
-// kbd_recv() below just watches for one that looks like a press. This
-// replaces an earlier version of this file that instead polled
-// channel 0's CPU-side status/data registers (0177560/0177562) --
-// the same ones EMT 0340/.TTYIN uses -- directly, hoping to read the
-// keyboard without RT-11's own blocking read(); that never saw a
-// keypress at all, since channel 0 only carries whatever the
-// PPU-resident monitor's own console driver is still choosing to send
-// over it, and this program's tag list (see gfourppu.c) has already
-// taken over the monitor's video/keyboard state the same way it
-// breaks console *output* too (see the comment right before
+// messaging (ppuc_recv_init(), see ppu_client.h) rather than by any
+// kind of polling: gfourppu.c's own keyboard interrupt handler (see
+// its header comment) forwards raw scancodes as they happen, and
+// kbd_recv() below just watches for one that looks like a press.
+// Channel 0's CPU-side status/data registers (0177560/0177562 -- the
+// ones EMT 0340/.TTYIN uses) are no use for this: that channel carries
+// only what the PPU-resident monitor's own console driver chooses to
+// send over it, and this program's tag list (see gfourppu.c) has taken
+// the monitor's video and keyboard state over -- the same reason
+// console *output* stops working too (see the comment right before
 // ppuc_run() below).
 //
 // Console messages go through write() rather than printf(): mixing
 // buffered stdio with real file I/O has a known, unresolved GCC
-// pdp11-backend codegen bug on this toolchain (see examples/ppurun's
-// own header comment). They only ever happen before ppuc_run() --
-// console I/O only works again once the PPU side has actually handed
-// control back to its own resident monitor (see examples/ppupong's
-// own header comment, and gfourppu.c's own header comment for when
-// gfourppu.c itself does that), and every write()/read() attempted
-// between ppuc_run() and that point has been observed to block,
-// possibly forever -- this program never attempts one, since it has
-// no way to know exactly when gfourppu.c has handed control back
-// without asking first, and its own kbd_recv()/any_key_pressed
-// mechanism below already covers everything it needs from the
-// keyboard -- exactly why that has its own, non-console channel.
+// pdp11-backend codegen bug on this toolchain. They only ever happen
+// before ppuc_run() -- console I/O works again only once the PPU side
+// has handed control back to its own resident monitor, and every
+// write()/read() attempted in between has been observed to block,
+// possibly forever. This program never attempts one: it has no way to
+// know exactly when gfourppu.c has handed control back without asking
+// first, and its own kbd_recv()/any_key_pressed mechanism below covers
+// everything it needs from the keyboard -- which is exactly why that
+// has its own, non-console channel.
 
 #include <stdlib.h>
 #include <unistd.h>
@@ -83,41 +68,27 @@
 #define NUM_FRAMES                                                             \
   3000 /* safety cap: stop even if no key ever comes (see kbd_recv()) */
 
-// Incremented by vsync_tick (see vsync_init() below) on every
-// EVNT trap -- vector 0000100, this hardware's line-clock interrupt,
-// confirmed earlier this session (against ukncbtl-qt's own Board.cpp
-// timing model) to fire twice per 40ms video frame, the second
-// landing right after the last visible scanline. wait_vsync() below
-// waits for this to advance by 2 (a full ~40ms video frame, not just
-// one ~20ms half of one) before returning.
-//
-// Just one tick wasn't enough headroom back when every screen word
-// went through the window ports: fill_rect_px()'s per-pixel
-// horizontal positioning needs a read-modify-write for every
-// partially-covered edge byte (see its own comment), which made a
-// single square's erase-move-draw noticeably heavier than the
-// original always-byte-aligned version -- confirmed directly, this
-// example visibly flickered again once movement went per-pixel, the
-// same symptom as the original no-vsync-at-all version, meaning
-// drawing was again finishing mid-scan on at least some frames rather
-// than safely inside the blanking gap. Waiting a full frame instead
-// of a half doubles that gap. The plain-pointer buffer is far cheaper
-// per word; the full-frame wait stays because it's the right pacing
-// anyway.
+// Incremented by vsync_tick (see vsync_init() below) on every EVNT
+// trap -- vector 0000100, this hardware's line-clock interrupt, which
+// fires twice per 40ms video frame, the second landing right after the
+// last visible scanline. wait_vsync() below waits for this to advance
+// by 2 (a full ~40ms frame, not just one ~20ms half of one) before
+// returning: a square's erase-move-draw has to finish inside the
+// blanking gap or the screen flickers, and a whole frame's worth of
+// gap is the pacing that holds whatever the drawing costs. It is not
+// free: fill_rect_px() reads, modifies and writes back every byte a
+// square only partially covers (see its own comment).
 static volatile unsigned int vsync_count;
 
 // The interrupt entry point (vsync_tick itself, declared by this same
 // macro -- see its own comment in pdp11_irq.h -- so vsync_init() below
 // can just take its address directly) and its callback body (a
 // separate, generated vsync_tick_impl) are both produced by this one
-// definition. Heavier than the hand-written version this replaces (that
-// one was a bare `INC
-// _vsync_count; RTI` -- INC operates directly on the memory operand,
-// so it never touched a register at all, nothing to save/restore):
-// saving and restoring all 6 registers around a real jsr/rts, twice
-// per video frame, costs real cycles this ISR never needed, but reuses
-// the same trampoline shape as gfourppu.c's own kbd_recv_byte instead
-// of a second hand-written one-off.
+// definition. It saves and restores all six registers around a real
+// jsr/rts twice per video frame, which this ISR does not need for a
+// single INC, and costs real cycles for it; what it buys is one
+// trampoline shape, the same one gfourppu.c's own kbd_recv_byte uses,
+// rather than a hand-written one-off per interrupt.
 PDP11_IRQ_HANDLER(vsync_tick) { vsync_count++; }
 
 static struct pdp11_vector saved_evnt;
@@ -202,11 +173,10 @@ static void msg(const char *s) {
 }
 
 // Small 16-bit LCG (classic constants) -- avoids pulling in newlib's
-// rand()/srand() state for something this cosmetic. Low bits of a
-// plain LCG have a very short period (bit 0 <=2, bit 1 <=4, ... --
-// confirmed directly earlier in this example's own history: masking
-// the raw low bits produced perfectly regular, non-random output), so
-// every caller here reads bits 6 and up instead.
+// rand()/srand() state for something this cosmetic. The low bits of a
+// plain LCG have a very short period (bit 0 <=2, bit 1 <=4, and so
+// on), enough to make masked output visibly regular, so every caller
+// here reads bits 6 and up instead.
 static unsigned int rng_state = 1;
 static unsigned int next_rand(void) {
   rng_state = rng_state * 25173u + 13849u;
@@ -235,10 +205,9 @@ static unsigned short color_word(unsigned int color) {
 // Zeroes the whole screen buffer -- called once at the very start:
 // fresh from malloc() it holds whatever the heap held before (mostly
 // the .PPU file ppuc_load_code() just read and freed). Nothing needs
-// clearing on the way out any more: RT-11's own console memory is
-// never written by this program now, so its screen comes back exactly
-// as it was left -- gfourppu.c only ever redirected the tag list away
-// from it and back.
+// clearing on the way out: RT-11's own console memory is never written
+// by this program, so its screen comes back exactly as it was left --
+// gfourppu.c only redirects the tag list away from it and back.
 static void clear_screen(void) {
   unsigned int n = (unsigned int)SCREEN_H * LINE_WORDS;
   volatile unsigned short *p = screen;
@@ -253,9 +222,7 @@ static void clear_screen(void) {
 // pixels, one bit each, the same bit position in both planes' bytes,
 // so a byte the square only partially overlaps (its left or right
 // edge) is read, has just the covered bits replaced, and written
-// back; a byte it fully covers skips straight to a plain write, the
-// same fast path fill_rect() used before this could only ever move in
-// whole 8-pixel steps.
+// back; a byte it fully covers skips straight to a plain write.
 static void fill_rect_px(int x, int row0, unsigned int color) {
   unsigned short word = color_word(color);
   int byte_lo = x >> 3;
@@ -414,11 +381,10 @@ int main(void) {
   // on its own (see its ppu_main()); wait for its bye before touching
   // RT-11 again -- an .EXIT that raced ahead of it would have its
   // first request to the PPU swallowed by gfourppu.c's still-armed
-  // channel-2 receiver, and RMON would wait for the answer forever
-  // (seen exactly so in the Digger port). On the NUM_FRAMES safety
-  // path no key was pressed, so gfourppu.c is still running: nothing
-  // will ever say bye, and this hangs -- the same "no orderly way out
-  // without a keypress" this example has always had, just moved here.
+  // channel-2 receiver, and RMON would wait for the answer forever. On
+  // the NUM_FRAMES safety path no key was pressed, so gfourppu.c is
+  // still running: nothing will ever say bye, and this waits here --
+  // there is no orderly way out of this example without a keypress.
   while (!ppu_bye) {
   }
   vsync_shutdown();

@@ -5,8 +5,7 @@
 // (ppus_start.o) into a REL module by pdp11-uknc-rt11-ld -r -m
 // pdp11rt11rel) proves it's really executing on the second CPU by
 // printing through the PPU-resident debug monitor's own EMT 056 call
-// -- see libs/libppu/ppu_client.h/ppu_server.h and Oleg Safiullin's
-// PRUN pptest.mac, which this is modeled on.
+// -- see libs/libppu/ppu_client.h and ppu_server.h.
 //
 // Console messages go through write() rather than printf()/puts():
 // mixing buffered stdio with real file I/O in one program has a

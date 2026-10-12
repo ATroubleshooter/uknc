@@ -1,12 +1,11 @@
 // pptest.c -- PPU-side payload for the ppurun example
 //
-// Modeled on Oleg Safiullin's PRUN pptest.mac
-// (pdp-11.org.ru/~form/files/pdp-11/uknc/prun/): proves this code is
-// really executing on the PPU by printing a fixed string through
-// ppus_debug_print() (EMT 056). ppu_main() is this program's own
-// entry point -- libppu's startup shim (ppus_start.c) calls it, then
-// frees this program's memory and returns to the PPU's resident
-// monitor automatically once ppu_main returns; see ppu_server.h.
+// Proves this code is really executing on the PPU by printing a fixed
+// string through ppus_debug_print() (EMT 056). ppu_main() is this
+// program's own entry point -- libppu's startup shim (ppus_start.c)
+// calls it, then frees this program's memory and returns to the PPU's
+// resident monitor automatically once ppu_main returns; see
+// ppu_server.h.
 //
 // Built (no gcc driver, no startfiles -- see ../Makefile) as a single
 // translation unit, linked with pdp11-uknc-rt11-ld-ppu -- the

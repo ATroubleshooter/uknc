@@ -3,105 +3,79 @@
 // Waits for gfour.c to say where its screen buffer is (one 2-byte
 // message: the buffer's plane offset -- see gfour.c's header comment
 // for why a CPU heap buffer is video memory), builds a video display
-// tag list in plane 0 pointing every visible scanline at it, then
-// stays resident -- its own keyboard interrupt handler (see kbd_init()
-// below) needs to stay installed for as long as gfour.c's own animation
-// loop is still running -- but, unlike a program meant to stay resident
-// for a whole game session, this program is only ever meant to run for
-// the lifetime of one gfour demo: the moment its own keyboard ISR sees
-// an actual key press (not
-// just a release -- same criterion as gfour.c's own kbd_recv()), it
-// forwards that event to the CPU as usual, then hands the *video*
-// console back (restore_tag0() below -- see its own comment for why
-// one saved tag is all that takes), restores vector 0300 to whatever
-// the PPU-resident monitor had there before (kbd_shutdown() below),
-// drops its channel-2 receiver, tells the CPU so (PPU_MSG_BYE), and
-// returns from ppu_main(), letting ppus_start.c's own shim free this
-// program's PPU memory block and hand control back to the resident
-// monitor (see ppu_server.h's own ppus_exit() comment) -- exactly the
-// same reasoning gfour.c's own vsync_init()/vsync_shutdown() pair
-// already follows on the CPU side. Without the vector restore, an earlier
-// version of this file left vector 0300 permanently pointing at this
-// program's own (about-to-be-stale) kbd_recv_byte and never gave
-// control back to the resident monitor at all: gfour.c's own animation
-// loop still noticed the keypress fine (forwarding worked), but the
-// whole system was left with no PPU program servicing the
-// keyboard/console for RT-11 itself -- confirmed directly: the CPU
-// program's own exit never reached a real RT-11 prompt, just stopped
-// animating in place forever. And without the tag-0 restore, even
-// after that fix the *display* stayed stuck on this program's own tag
-// chain/palette forever, showing whatever it last drew -- nothing else
-// ever points TAG_BASE back at RT-11's own chain on its own. Video
-// itself needs nothing further while this program *is* running: the
-// generator re-reads planes 0/1/2 every real frame on its own
-// regardless of what PPU code is or isn't running.
+// tag list in plane 0 pointing every visible scanline at it, then stays
+// resident: its own keyboard interrupt handler (see kbd_init() below)
+// has to stay installed for as long as gfour.c's animation loop is
+// running. It is meant to live exactly as long as one gfour run, so the
+// moment its keyboard ISR sees an actual key press (not just a release
+// -- the same criterion as gfour.c's own kbd_recv()) it forwards that
+// event to the CPU as usual, then hands the *video* console back
+// (restore_tag0() below -- see its own comment for why one saved tag is
+// all that takes), restores vector 0300 to whatever the PPU-resident
+// monitor had there before (kbd_shutdown() below), drops its channel-2
+// receiver, tells the CPU so (PPU_MSG_BYE), and returns from
+// ppu_main(), letting ppus_start.c's shim free this program's PPU
+// memory block and hand control back to the resident monitor (see
+// ppu_server.h's own ppus_exit() comment) -- the same discipline
+// gfour.c's own vsync_init()/vsync_shutdown() pair follows on the CPU
+// side.
 //
-// Keyboard input is PPU-only hardware (0177700 status/0177702 data, PPU
-// interrupt vector 0300 -- confirmed against ukncbtl-qt's own
-// emulator/emubase/Board.cpp, ChanRxStateGetCPU()/ChanReadByCPU()
-// notwithstanding: those are channel 0, a CPU<->PPU *messaging* path
-// RT-11's own .TTYIN happens to be plumbed through while its
-// PPU-resident monitor is still driving the console -- not the
-// keyboard controller itself, and no longer serviced once this
-// program's own tag list has taken over the monitor's video state, the
-// same way console output stops working then too -- see gfour.c's own
-// header comment. This file's own earlier version tried polling
-// channel 0 straight from the CPU for exactly this reason and it
-// silently never saw a keypress once the PPU monitor stopped feeding
-// it). The real, always-live path is 0177700/0177702, reachable only
-// from the PPU -- confirmed against a real UKNC game's own PPU-side
-// keyboard ISR (blairecas/descent, descnt_ppu.mac), and independently
-// against the "УКНЦ Техническое описание" hardware manual. This file's
-// own ISR (kbd_init()/kbd_recv_byte) mirrors descent's, forwarding raw
-// scancodes to the CPU over libppu's own channel-1 PPU->CPU messaging
-// (ppus_send()/ppuc_recv_init(), see ppu_server.h/ppu_client.h) instead
-// of descent's own shared-CPU-RAM approach, since libppu already
-// provides exactly this and gfour.c has no per-key state of its own to
-// update directly.
+// Both restores matter, and for different reasons. Vector 0300 left
+// pointing into this program's memory after ppus_exit() has freed it
+// leaves RT-11 with nothing servicing the keyboard and console at all:
+// the next keyboard interrupt lands on whatever is there by then. And
+// tag 0 left pointing at this program's own chain leaves the display
+// showing whatever it last drew, because nothing else ever points
+// TAG_BASE back at RT-11's chain. Video itself needs nothing further
+// while this program runs: the generator re-reads planes 0/1/2 every
+// frame on its own, whatever PPU code is or is not running.
 //
-// Tag list format (reverse-engineered from ukncbtl-qt's own decoder,
-// emulator/Emulator.cpp:Emulator_PrepareScreenRGB32 -- not from any
-// official datasheet, since no ROM/EMT-level graphics API or hardware
-// manual for this turned up anywhere in this project): the video
-// generator processes one 2- or 4-word "tag" per scanline, 307
-// tags/frame (19 invisible + 288 visible), always starting with a
-// fixed first tag at plane-0 byte address 0000270. A 2-word tag is
+// Keyboard input is PPU-only hardware: status at 0177700, data at
+// 0177702, PPU interrupt vector 0300 (the "УКНЦ Техническое описание"
+// hardware manual has them). Channel 0 is not that -- it is a
+// CPU<->PPU messaging path that RT-11's .TTYIN happens to be plumbed
+// through while the PPU-resident monitor is still driving the console,
+// and it stops being serviced once this program's tag list has taken
+// the monitor's video state over, the same way console output stops
+// working then (see gfour.c's header comment). This file's ISR
+// (kbd_init()/kbd_recv_byte) forwards raw scancodes to the CPU over
+// libppu's channel-1 PPU->CPU messaging (ppus_send()/ppuc_recv_init(),
+// see ppu_server.h/ppu_client.h); gfour.c has no per-key state of its
+// own to update, so discrete events are all it needs.
+//
+// Tag list format, as the video generator reads it (no datasheet for
+// this: what follows is what the hardware does, worked out from the
+// list RT-11 itself leaves at boot and from what comes out on screen).
+// The generator processes one 2- or 4-word "tag" per scanline, 307
+// tags/frame (19 invisible + 288 visible), always starting with a fixed
+// first tag at plane-0 byte address 0000270. A 2-word tag is
 // {addressBits, tagB}; a 4-word tag prepends {word1, word2} (meaning
 // depends on type). tagB's low bits control the *next* tag: bit 0
 // toggles the cursor (unused here -- never set, so the cursor never
 // appears), bit 1 says the next tag is 4-word, bit 2 (only meaningful
-// if bit 1 is set) says that 4-word tag sets the palette (1) vs
-// params (0); the rest of tagB, with those low bits masked off, is
-// the next tag's own byte address (8-byte aligned if the next tag is
-// 4-word, 4-byte aligned if 2-word). The very first tag of the frame
-// is always treated as 2-word, regardless of its own content -- so
-// tag 0, fixed at 0000270, only ever redirects into the real list
-// below, at a separate fixed address (TAG_LIST_BASE).
+// if bit 1 is set) says that 4-word tag sets the palette (1) vs params
+// (0); the rest of tagB, with those low bits masked off, is the next
+// tag's own byte address (8-byte aligned if the next tag is 4-word,
+// 4-byte aligned if 2-word). The very first tag of the frame is always
+// treated as 2-word, regardless of its own content -- so tag 0, fixed
+// at 0000270, only ever redirects into the real list below, at a
+// separate fixed address (TAG_LIST_BASE).
 //
 // Where the pixels themselves live: in gfour.c's own malloc()ed buffer,
 // at plane offset (CPU address / 2), received from the CPU at startup
-// (see ppu_main()) -- the visible tags simply walk that buffer 40
-// bytes per line. Plane 0 at those same offsets is *this* processor's
-// own RAM (the monitor, this program, the tag list), so it is never
-// touched: the palette below gives every odd slot the color of the
-// even slot under it, which makes plane 0's bit invisible instead.
-//
-// This is the second address scheme this file has used. The first
-// version pointed the tags at RT-11's own console text screen, plane
-// offset 0100000 (found by decoding the live default tag list at boot,
-// and confirmed by 3 real UKNC games that run under RT-11 --
-// nzeemin/uknc-highwayencounter, uknc-loderunner, uknc-desolate -- all
-// drawing there), which both processors can only reach through their
-// window-register ports (CPU: 0176640/0176642, PPU: 0177010/0177012 --
-// plane offsets >= 0100000 are outside both direct address ranges,
-// confirmed against ukncbtl-qt/emulator/emubase/Memory.cpp's
-// TranslateAddress logic), two I/O accesses per word. The CPU's own
-// RAM being planes 1/2 below 0157777 made the buffer approach possible
-// (Digger did it first; bolder and soft_scroll_test on GitHub did it
-// years earlier); its one cost is the palette trick above, since the
-// buffer's plane-0 counterpart can't be zeroed the way 0100000's could.
-// A side benefit: RT-11's console memory is never written at all now,
-// so its text screen is exactly as it was when this program exits.
+// (see ppu_main()) -- the visible tags simply walk that buffer 40 bytes
+// per line. Plane 0 at those same offsets is *this* processor's own RAM
+// (the monitor, this program, the tag list), so it is never touched:
+// the palette below gives every odd slot the color of the even slot
+// under it, which makes plane 0's bit invisible instead. That palette
+// trick is what a CPU buffer costs. The alternative is RT-11's own
+// console text screen at plane offset 0100000, which both processors
+// can reach only through their window-register ports (CPU:
+// 0176640/0176642, PPU: 0177010/0177012 -- plane offsets >= 0100000
+// are outside both direct address ranges), two I/O accesses per word;
+// examples/sin draws there, having no room for a buffer of its own.
+// RT-11's console memory is never written here at all, so its text
+// screen is exactly as it was when this program exits.
 
 #include "ppu_server.h"
 #include "pdp11_irq.h"
@@ -117,15 +91,13 @@
 
 // Fixed, compile-time base for the real tag list (tag 0 at TAG_BASE
 // above just redirects here -- see file header comment): a literal
-// address rather than a C array, since this toolchain's a.out backend
-// puts every global into .data regardless of whether it's ever
-// initialized, and an array big enough for all 306 remaining tags
-// (616 words) pushes a PPU module's linked .data size past an
-// undiagnosed limit in this project's own `ld -r -m pdp11rt11rel`
-// pass (confirmed directly: it fails with "cannot read section
-// `.text': file truncated" once combined .text+.data crosses roughly
-// 1340 bytes, well under what a real PPU program's free memory could
-// otherwise hold) -- picked well above where a small compiled program
+// address rather than a C array: an array big enough for all 306
+// remaining tags (616 words) pushes a PPU module past a limit in the
+// `ld -r -m pdp11rt11rel` pass, which fails with "cannot read section
+// `.text': file truncated" once its combined .text and .data cross
+// roughly 1340 bytes -- well under what a PPU program's free memory
+// could otherwise hold. The address is picked well above where a small
+// compiled program
 // starting at the usual load address (01000, see ppu_server.h) could
 // ever reach, and well under plane 0's own direct-access ceiling
 // (077777).
@@ -188,9 +160,9 @@ static void build_tags(unsigned int screen_base) {
   // 0/2/4/6); plane 0 under its buffer is this processor's own RAM,
   // not something to zero (see file header comment), so each odd slot
   // gets the even slot's color and plane 0's bit changes nothing.
-  // Nibble values are this hardware's YRGB encoding (confirmed against
-  // ukncbtl-qt's own color table, group 0 = pbpgpr's "full brightness"
-  // row): 0=black, 0xA=bright green, 0xC=bright red, 0xF=white.
+  // Nibble values are this hardware's YRGB encoding, in the "full
+  // brightness" palette group tag 1 selects: 0=black, 0xA=bright
+  // green, 0xC=bright red, 0xF=white.
   next = ALIGN4(pos + 8);
   poke(pos, 0xAA00);     /* w1: slots 0/1=black, slots 2/3=green */
   poke(pos + 2, 0xFFCC); /* w2: slots 4/5=red, slots 6/7=white */
@@ -251,11 +223,9 @@ static void restore_tag0(void) {
 
 // Set by kbd_recv_byte, drained by ppu_main()'s own loop -- a single
 // slot, not a queue: a press arriving while the previous one is still
-// unsent overwrites it. Fine for gfour's own "did any key go down"
-// use -- see gfour.c's own header comment for why a real queue isn't
-// needed here (unlike descent's own per-key state array, which has no
-// such gap since it updates persistent state directly instead of
-// forwarding discrete events).
+// unsent overwrites it. All gfour.c asks is whether any key went down,
+// so a dropped second press costs it nothing; a program that tracked
+// each key would want state instead of discrete events.
 static volatile unsigned char kbd_pending;
 static volatile unsigned char kbd_event;
 
@@ -263,17 +233,14 @@ static volatile unsigned char kbd_event;
 // same macro -- see its own comment in pdp11_irq.h -- so kbd_init()
 // below can just take its address directly) and its callback body (a
 // separate, generated kbd_recv_byte_impl) are both produced by this
-// one definition. b is the one scancode
-// byte the trampoline read from @$0177702 (exactly once -- re-reading
-// it would consume/re-latch whatever the *next* scancode is, not
-// re-read this one, confirmed against descnt_ppu.mac's own handler,
-// which carries an explicit comment for the same reason). Heavier than
-// the hand-written version this replaces (that one saved only r0 and
-// stored the byte directly with two MOVBs, no call at all) -- saving
-// and restoring all 6 registers around a real jsr/rts costs real
-// cycles/words this ISR never needed, but reuses the exact same
-// trampoline shape as libppu's ppuc_recv_isr/ppus_recv_isr instead of a
-// second hand-written copy.
+// one definition. b is the one scancode byte the trampoline read from
+// @$0177702, and it is read exactly once: re-reading the data register
+// consumes or re-latches whatever the *next* scancode is rather than
+// giving this one again. The trampoline saves and restores all six
+// registers around a real jsr/rts, which this ISR does not need for a
+// byte store; what it buys is the same trampoline shape libppu's own
+// ppuc_recv_isr/ppus_recv_isr use, rather than a hand-written copy per
+// interrupt.
 PDP11_IRQ_RECV_BYTE(kbd_recv_byte, 0177702) {
   kbd_event = b;
   kbd_pending = 1;
@@ -286,10 +253,9 @@ static struct pdp11_vector saved_kbd_vec;
 
 // Installs kbd_recv_byte over vector 0000300 (saving whatever was
 // there before, for kbd_shutdown() to put back, via
-// pdp11_irq_vector_swap() -- see pdp11_irq.h -- for the same reason
-// ppu_main()'s own comment explains this program restores it instead
-// of leaving it permanently overwritten the way an earlier version
-// did) and enables the keyboard's own interrupt (KBD_CSR's bit 0100).
+// pdp11_irq_vector_swap() -- see pdp11_irq.h, and the file header
+// comment for why the vector has to go back) and enables the
+// keyboard's own interrupt (KBD_CSR's bit 0100).
 // pdp11_irq_vector_swap() itself masks interrupts for the swap, so an
 // already-pending keystroke can't fire mid-install and land on a
 // half-written vector.
@@ -332,10 +298,10 @@ void ppu_main(void) {
   kbd_init();
 
   // Stays resident until an actual key press (not a release) comes
-  // through -- see the file header comment for why this can no longer
-  // just build the tag list and return the way an even earlier version
-  // did, and for why it also can't stay resident forever the way
-  // diggerppu.c does. ppus_send() itself is an ordinary blocking call
+  // through: returning as soon as the tag list is built would take the
+  // keyboard handler with it, and staying resident for good would
+  // never give RT-11 its console back -- see the file header comment.
+  // ppus_send() itself is an ordinary blocking call
   // (see ppu_server.h), safe to make from this normal foreground loop
   // even though it would not be safe to make directly from
   // kbd_recv_byte's own callback body (running in interrupt context)

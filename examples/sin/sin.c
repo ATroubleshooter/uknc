@@ -44,9 +44,9 @@
 // lives instead, plane offset 0100000, which costs nothing in RAM
 // because it is not in the CPU's address space at all -- it is reached
 // through the window registers at 0176640/0176642, an address write and
-// a data write per eight pixels.  gfourppu.c's header comment tells the
-// story of that address; this program is the case where the old way is
-// the only way that fits.  The text that was on the console screen is
+// a data write per eight pixels.  gfourppu.c's header comment has that
+// address and what it costs; this program is the case where paying it is
+// the only thing that fits.  The text that was on the console screen is
 // overwritten, and the screen is cleared again on the way out.
 //
 // Console messages go through write() rather than printf(), and only
