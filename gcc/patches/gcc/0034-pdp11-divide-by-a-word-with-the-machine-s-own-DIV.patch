@@ -1,0 +1,137 @@
+From: Yury Klushin <digger@live.ru>
+Date: Mon, 12 Oct 2026 19:10:00 +0300
+Subject: [PATCH] pdp11: divide by a word with the machine's own DIV
+
+The shift-and-subtract loop pays for thirty-two steps whatever the
+operands, and almost every division a program actually does is by a
+small constant or an int -- a divisor that fits a word, which is the one
+case DIV handles itself.
+
+It takes two passes: the dividend's high word first, then its low word
+with that remainder in front of it.  The pair has to be shifted right by
+a bit before the second pass, because a quotient of up to 65535 does not
+fit the signed word DIV produces; afterwards the quotient is doubled and
+the bit that left is returned to the remainder, which is then compared
+with the divisor once in case it has grown into it.  A divisor of one is
+left to the loop for the same overflow reason, and zero because the
+answer for it is decided further down.
+
+Signs are not touched here: the fast path works on the absolute values
+the entry code has already prepared and leaves the quotient and the
+remainder exactly where the loop would, so the one piece of code that
+applies the signs stays the only one.
+
+Ticks per operation, measured on the machine, divisor seven:
+
+                  before   after
+  __divsi3          8374    2051
+  __modsi3          8468    2143
+
+and with a divisor that does not fit a word, where the loop still does
+the work, the test for the fast path costs about fifty ticks:
+
+  __divsi3          6834    6884
+  __modsi3          6926    6978
+
+examples/spigot, which is little but `d % b' and `d /= b' over longs,
+goes from 39800 frames to 14058.  The sweep in tests/pdp11-fis covers
+the new path, and the invariants q*b + r == a, |r| < |b| and the sign of
+r hold over four thousand operand pairs weighted towards word
+boundaries.
+
+ libgcc/config/pdp11/pdp11-divmod.S | 66 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 58 insertions(+), 8 deletions(-)
+
+diff -urN a/libgcc/config/pdp11/pdp11-divmod.S b/libgcc/config/pdp11/pdp11-divmod.S
+--- a/libgcc/config/pdp11/pdp11-divmod.S	2026-10-12 19:06:19
++++ b/libgcc/config/pdp11/pdp11-divmod.S	2026-10-12 19:06:19
+@@ -24,13 +24,26 @@
+ 
+ /* The machine's own DIV divides 32 bits by 16 and is signed, so
+    anything wider or unsigned is a subroutine.  The four entry points
+-   below share one loop: thirty-two shift-and-subtract steps, with the
+-   dividend and the quotient in the same register pair -- the dividend
+-   leaves R1 at the top as the quotient's bits enter at the bottom --
+-   the running remainder in R4:R5 and the divisor in R2:R3.  Six
+-   registers, nothing spilled, and no normalisation pass, which is what
+-   makes this several times faster than the generic C in udivmodsi4.c.
++   below share two paths.
+ 
++   When the divisor fits a word -- 2 through 32767, which is what nearly
++   every division by a constant or an int looks like -- DIV does the work
++   in two passes: the dividend's high word first, then its low word with
++   that remainder in front of it.  The pair is shifted right by a bit
++   before the second pass, because the quotient would otherwise not fit a
++   word; afterwards the quotient is doubled and the bit that left is
++   returned to the remainder.  One is excluded because a quotient of
++   65535 does not fit the signed word DIV produces, and zero because
++   division by zero must fall through to the answer below.
++
++   Everything else goes through one loop: thirty-two shift-and-subtract
++   steps, with the dividend and the quotient in the same register pair --
++   the dividend leaves R1 at the top as the quotient's bits enter at the
++   bottom -- the running remainder in R4:R5 and the divisor in R2:R3.
++   Six registers, nothing spilled, and no normalisation pass, which is
++   what makes even this several times faster than the generic C in
++   udivmodsi4.c.
++
+    The ABI is the compiler's own for a two-word type: the arguments are
+    on the stack, high word first, and the result comes back in R0:R1
+    with the high word in R0.  A word of operation type is pushed by the
+@@ -99,9 +112,46 @@
+ 3:	bne	4f
+ 	tst	r3
+ 	beq	9f		/* divisor is zero: the answer is zero */
+-4:	clr	r4		/* R4:R5 = running remainder */
++4:	tst	r2		/* is the divisor wider than a word? */
++	bne	11f
++	tst	r3
++	ble	11f		/* zero, or 32768 and up: not for DIV */
++	dec	r3
++	beq	15f		/* one: the quotient would not fit a word */
++	inc	r3
++
++	mov	r1, r4		/* R4 = dividend low */
++	mov	r0, r1		/* R0:R1 = 0:dividend high */
++	clr	r0
++	tst	r1
++	beq	12f		/* high word is zero: nothing to divide yet */
++	div	r3, r0
++12:	mov	r0, r2		/* R2 = quotient high */
++	mov	r1, r0		/* R0:R1 = remainder:dividend low */
++	mov	r4, r1
+ 	clr	r5
++	asr	r0		/* a bit right, or the quotient overflows */
++	ror	r1
++	ror	r5		/* the bit that left waits in R5's top */
++	div	r3, r0
++	asl	r0		/* twice the quotient ... */
++	asl	r1		/* ... and twice the remainder ... */
++	rol	r5		/* ... plus the bit that left */
++	adc	r1
++	cmp	r1, r3
++	blo	13f
++	sub	r3, r1		/* the remainder reached the divisor */
++	inc	r0
++13:	mov	r1, r5		/* leave it all where the loop would */
++	clr	r4
++	mov	r0, r1
++	mov	r2, r0
++	br	14f
+ 
++15:	inc	r3		/* the divisor was one: put it back */
++11:	clr	r4		/* R4:R5 = running remainder */
++	clr	r5
++
+ 5:	asl	r1		/* dividend out at the top, quotient in */
+ 	rol	r0
+ 	rol	r5		/* the bit that left enters the remainder */
+@@ -118,7 +168,7 @@
+ 7:	decb	(sp)
+ 	bne	5b
+ 
+-	tstb	10(sp)		/* quotient wanted? */
++14:	tstb	10(sp)		/* quotient wanted? */
+ 	beq	8f
+ 	mov	r5, r1		/* no: the remainder is the answer */
+ 	mov	r4, r0
