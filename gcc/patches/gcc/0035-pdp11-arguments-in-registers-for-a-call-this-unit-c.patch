@@ -1,0 +1,388 @@
+From: Yury Klushin <digger@live.ru>
+Date: Mon, 12 Oct 2026 20:30:00 +0300
+Subject: [PATCH] pdp11: arguments in registers for a call this unit can see
+
+Every argument on this target goes on the stack: the caller pushes it,
+the callee reads it back through an index, and the caller takes it off
+again.  For a small function that is most of what the call costs, and
+the machine has two registers -- R0 and R1 -- that a call is already
+free to destroy.
+
+A register convention can only be used where both sides of the call are
+certain to agree about it.  Without an attribute to declare one, that
+means a function this unit can see every call to: the call names a
+declaration, the declaration is local to the translation unit and its
+address is never taken, so no indirect call can reach it.  That is what
+cgraph's "local" and "can_change_signature" say, and it is what the x86
+port uses to the same end.  The answer is taken from the callee, not the
+caller, so that both sides compute it the same way; and because the
+flag is only there once the IPA passes have run, -O0 keeps the stack
+convention, which also keeps a program easy to follow in a debugger.
+
+The window is the two call-clobbered registers and nothing more.  A
+wider one would mean telling the generic code, per call, that this call
+destroys registers the standard convention preserves, and this port has
+none of that machinery.  Within the window: integers and pointers only,
+since a floating value wants the registers the callee saves and an
+aggregate is passed as the block of memory it is; a value of two words
+has to start on an even register, which is all pdp11_hard_regno_mode_ok
+allows, and has to fit whole, because an argument is never split
+between a register and the stack; and once one argument has gone to the
+stack the rest follow it, so what is left on the stack is the picture
+the standard convention draws, minus a prefix.
+
+Nothing else moves.  A library call, a call through a pointer, a call to
+anything outside the unit, a variable argument list -- all keep the
+convention they had, so objects built earlier, the hand-written
+assembly in libgcc and modules from a foreign assembler go on working
+unchanged.  -mno-reg-args turns the whole thing off.
+
+Twenty thousand calls in a loop, frames at fifty to the second:
+
+                     stack   registers
+  f(int, int)          116          94
+  f(int, int, int)     123         105
+  f(long)              113          96
+  f(long, int)         127         133
+
+The last line is the one case where it costs: the pushed int needs a
+scratch register while the pair is held, the allocator takes R0 for it,
+and the accumulator that would have stayed in the return pair is
+spilled instead.  examples/spigot, which is division in a loop and
+calls nothing local in it, goes 13893 -> 13875 frames and 12736 ->
+12720 bytes of text.
+
+Tested with three new target tests; with a sample of 120
+gcc.c-torture/execute tests -- the va-arg and structure-passing ones,
+the nested-function ones, and the block beginning with 2 -- run on the
+machine both ways, which give the same results in both (one failure,
+nestfunc-3, is the trampolines, and fails without this too); and with
+libgcc, newlib and the repository's own tests and examples rebuilt and
+run.
+
+---
+ gcc/config/pdp11/pdp11-protos.h             |    1 
+ gcc/config/pdp11/pdp11.cc                   |   99 +++++++++++++++++++++++++++-
+ gcc/config/pdp11/pdp11.h                    |   36 +++++++---
+ gcc/config/pdp11/pdp11.opt                  |    4 +
+ gcc/doc/invoke.texi                         |   13 +++
+ gcc/testsuite/gcc.target/pdp11/reg-args-1.c |   22 ++++++
+ gcc/testsuite/gcc.target/pdp11/reg-args-2.c |   15 ++++
+ gcc/testsuite/gcc.target/pdp11/reg-args-3.c |   25 +++++++
+ 8 files changed, 202 insertions(+), 13 deletions(-)
+
+diff -urN a/gcc/config/pdp11/pdp11-protos.h b/gcc/config/pdp11/pdp11-protos.h
+--- a/gcc/config/pdp11/pdp11-protos.h	2026-10-12 20:07:20
++++ b/gcc/config/pdp11/pdp11-protos.h	2026-10-12 20:07:20
+@@ -48,6 +48,7 @@
+ 
+ #endif /* RTX_CODE */
+ 
++extern int pdp11_arg_regs (const_tree, const_tree);
+ extern void output_ascii (FILE *, const char *, int);
+ extern void pdp11_asm_output_var (FILE *, const char *, int, int, bool);
+ extern void pdp11_expand_prologue (void);
+diff -urN a/gcc/config/pdp11/pdp11.cc b/gcc/config/pdp11/pdp11.cc
+--- a/gcc/config/pdp11/pdp11.cc	2026-10-12 20:07:20
++++ b/gcc/config/pdp11/pdp11.cc	2026-10-12 20:07:20
+@@ -37,6 +37,7 @@
+ #include "regs.h"
+ #include "emit-rtl.h"
+ #include "recog.h"
++#include "cgraph.h"
+ #include "conditions.h"
+ #include "output.h"
+ #include "stor-layout.h"
+@@ -2362,12 +2363,100 @@
+   emit_move_insn (mem, fnaddr);
+ }
+ 
++/* How many words of a call's arguments may be handed over in
++   registers: PDP11_NARGREGS, or none at all.
++
++   The standard convention of this machine is that arguments go on the
++   stack, and that is what every object this compiler did not just
++   produce expects -- the library, the assembly a program brings with
++   it, the modules a foreign assembler made.  A register convention can
++   only be used where both sides of the call are known to be compiled
++   the same way, and without a declared attribute to say so, that means
++   a function this unit can see every call to: FNDECL names it, its
++   address is never taken, and nothing outside can reach it.  The
++   cgraph flags below say exactly that, and they are what the x86 port
++   uses for the same purpose.
++
++   The answer has to come out the same when the caller is expanded and
++   when the callee is, which is why it is taken from the callee: the
++   optimisation level is read off the callee's own decl, since an
++   attribute can make the two differ.  */
++
++int
++pdp11_arg_regs (const_tree fntype, const_tree fndecl)
++{
++  cgraph_node *node;
++
++  if (fndecl == NULL_TREE || TREE_CODE (fndecl) != FUNCTION_DECL)
++    return 0;
++
++  /* A variable argument list is walked as one block of stack, so the
++     named arguments in front of it cannot start in registers.  */
++  if (fntype != NULL_TREE && stdarg_p (fntype))
++    return 0;
++
++  node = cgraph_node::get (fndecl);
++  if (node != NULL)
++    node = node->function_symbol ();
++  if (node == NULL || !node->local || !node->can_change_signature)
++    return 0;
++
++  /* The optimisation level is read off the callee's own decl, because an
++     attribute can make the caller's differ and the two sides have to
++     reach the same answer.  -mreg-args needs no such care: this port has
++     no per-function target options for a pragma to change.  */
++  if (!TARGET_REG_ARGS || !opt_for_fn (node->decl, optimize))
++    return 0;
++
++  return PDP11_NARGREGS;
++}
++
++/* Where ARG goes: its size in words if it is to travel in registers,
++   with *REGNO (when REGNO is given) set to the first of them, and zero
++   if it belongs in memory.  */
++
++static int
++pdp11_arg_in_regs (CUMULATIVE_ARGS *cum, const function_arg_info &arg,
++		   unsigned int *regno)
++{
++  int words, first;
++
++  if (cum->regs_left == 0 || arg.end_marker_p ())
++    return 0;
++
++  /* Integers and pointers only.  A floating value would want the
++     floating registers, which the callee saves, and an aggregate is
++     passed as the block of memory it is.  */
++  if (!SCALAR_INT_MODE_P (arg.mode) || arg.aggregate_type_p ())
++    return 0;
++
++  words = CEIL (arg.promoted_size_in_bytes ().to_constant (), UNITS_PER_WORD);
++  first = PDP11_NARGREGS - cum->regs_left;
++
++  /* Two words or more have to start on an even register, which is what
++     pdp11_hard_regno_mode_ok allows, and have to fit whole: this
++     convention never splits an argument between a register and the
++     stack.  */
++  if (words > cum->regs_left || (words > 1 && (first & 1) != 0))
++    return 0;
++
++  if (regno != NULL)
++    *regno = first;
++  return words;
++}
++
+ /* Worker function for TARGET_FUNCTION_ARG.  */
+ 
+ static rtx
+-pdp11_function_arg (cumulative_args_t, const function_arg_info &)
++pdp11_function_arg (cumulative_args_t cum_v, const function_arg_info &arg)
+ {
+-  return NULL_RTX;
++  CUMULATIVE_ARGS *cum = get_cumulative_args (cum_v);
++  unsigned int regno;
++
++  if (pdp11_arg_in_regs (cum, arg, &regno) == 0)
++    return NULL_RTX;
++
++  return gen_rtx_REG (arg.mode, regno);
+ }
+ 
+ /* Worker function for TARGET_FUNCTION_ARG_ADVANCE.
+@@ -2379,8 +2468,12 @@
+ 			    const function_arg_info &arg)
+ {
+   CUMULATIVE_ARGS *cum = get_cumulative_args (cum_v);
++  int words = pdp11_arg_in_regs (cum, arg, NULL);
+ 
+-  *cum += arg.promoted_size_in_bytes ();
++  /* Once one argument has gone to the stack the rest follow it, so
++     that what is left on the stack is the picture the standard
++     convention draws, minus a prefix.  */
++  cum->regs_left = (words == 0) ? 0 : cum->regs_left - words;
+ }
+ 
+ /* Make sure everything's fine if we *don't* have an FPU.
+diff -urN a/gcc/config/pdp11/pdp11.h b/gcc/config/pdp11/pdp11.h
+--- a/gcc/config/pdp11/pdp11.h	2026-10-12 20:07:20
++++ b/gcc/config/pdp11/pdp11.h	2026-10-12 20:07:20
+@@ -371,9 +371,19 @@
+  (FLOAT_MODE_P (MODE) ? AC0_REGNUM : RETVAL_REGNUM)
+ 
+ /* 1 if N is a possible register number for function argument passing.
+-   - not used on pdp */
++   The two call-clobbered registers, and only where pdp11_arg_regs lets
++   the register convention be used at all.  */
+ 
+-#define FUNCTION_ARG_REGNO_P(N) 0
++#define FUNCTION_ARG_REGNO_P(N) ((N) == 0 || (N) == 1)
++
++/* How many words of arguments that convention may carry, and so how
++   many registers starting at R0 it uses.  The pair is R0 and R1
++   because those are the two a caller does not expect to get back (see
++   CALL_USED_REGISTERS); a wider window would mean telling the generic
++   code, per call, that a call clobbers more than the standard
++   convention clobbers, and nothing here says that yet.  */
++
++#define PDP11_NARGREGS 2
+ 
+ /* Define a data type for recording info about an argument list
+    during the scan of that argument list.  This data type should
+@@ -381,20 +391,28 @@
+    and about the args processed so far, enough to enable macros
+    such as FUNCTION_ARG to determine where the next arg should go.
+ 
+-*/
++   Here that is how many of the argument registers are still free: the
++   stack offsets are the generic code's own business, and nothing in
++   this port reads them back.  */
+ 
+-#define CUMULATIVE_ARGS int
++struct pdp11_args
++{
++  int regs_left;
++};
+ 
++#define CUMULATIVE_ARGS struct pdp11_args
++
+ /* Initialize a variable CUM of type CUMULATIVE_ARGS
+    for a call to a function whose data type is FNTYPE.
+    For a library call, FNTYPE is 0.
+ 
+-   ...., the offset normally starts at 0, but starts at 1 word
+-   when the function gets a structure-value-address as an
+-   invisible first argument.  */
++   FNDECL is the function being called, or null when the target of the
++   call is not a declaration this unit can see -- a library call, or a
++   call through a pointer.  Whether an argument may travel in a
++   register is decided from it, once per call, by pdp11_arg_regs.  */
+ 
+-#define INIT_CUMULATIVE_ARGS(CUM, FNTYPE, LIBNAME, INDIRECT, N_NAMED_ARGS) \
+- ((CUM) = 0)
++#define INIT_CUMULATIVE_ARGS(CUM, FNTYPE, LIBNAME, FNDECL, N_NAMED_ARGS) \
++ ((CUM).regs_left = pdp11_arg_regs ((FNTYPE), (FNDECL)))
+ 
+ /* Output assembler code to FILE to increment profiler label # LABELNO
+    for profiling a function entry.  */
+diff -urN a/gcc/config/pdp11/pdp11.opt b/gcc/config/pdp11/pdp11.opt
+--- a/gcc/config/pdp11/pdp11.opt	2026-10-12 20:07:20
++++ b/gcc/config/pdp11/pdp11.opt	2026-10-12 20:07:20
+@@ -85,3 +85,7 @@
+ mlra
+ Target Mask(LRA)
+ Use LRA register allocator.
++
++mreg-args
++Target Var(TARGET_REG_ARGS) Init(1)
++Pass the first arguments of a call in registers where both sides of the call are compiled together.
+diff -urN a/gcc/doc/invoke.texi b/gcc/doc/invoke.texi
+--- a/gcc/doc/invoke.texi	2026-10-12 20:07:20
++++ b/gcc/doc/invoke.texi	2026-10-12 20:07:20
+@@ -1251,7 +1251,8 @@
+ @gccoptlist{-mfpu  -msoft-float  -mfis  -mno-fis  -mac0  -mno-ac0
+ -m40  -m45  -m10
+ -mint32  -mno-int16  -mint16  -mno-int32
+--msplit  -munix-asm  -mdec-asm  -mgnu-asm  -mlra}
++-msplit  -munix-asm  -mdec-asm  -mgnu-asm  -mlra
++-mreg-args  -mno-reg-args}
+ 
+ @emph{PowerPC Options}
+ See RS/6000 and PowerPC Options.
+@@ -30944,6 +30945,16 @@
+ @item -mlra
+ Use the new LRA register allocator.  By default, the old ``reload''
+ allocator is used.
++
++@opindex mreg-args
++@opindex mno-reg-args
++@item -mreg-args
++Pass the first two words of a call's arguments in R0 and R1 where the
++called function is one the compiler can see every call to: a function
++local to the translation unit whose address is never taken.  Everything
++else keeps the standard convention, in which all arguments are pushed on
++the stack.  This is the default; @option{-mno-reg-args} passes every
++argument on the stack.
+ @end table
+ 
+ @node PowerPC Options
+diff -urN a/gcc/testsuite/gcc.target/pdp11/reg-args-1.c b/gcc/testsuite/gcc.target/pdp11/reg-args-1.c
+--- a/gcc/testsuite/gcc.target/pdp11/reg-args-1.c	1970-01-01 03:00:00
++++ b/gcc/testsuite/gcc.target/pdp11/reg-args-1.c	2026-10-12 20:07:20
+@@ -0,0 +1,22 @@
++/* { dg-do compile { target pdp11-*-* } } */
++/* { dg-options "-O2" } */
++/* A function this unit can see every call to takes its first two words
++   of arguments in R0 and R1, so the body works on the registers and
++   reads nothing off the stack.  */
++
++static int __attribute__((noinline,noclone)) loc (int a, int b)
++{
++  return a - b;
++}
++
++extern int ext (int a, int b);
++
++int use (int x, int y)
++{
++  /* { dg-final { scan-assembler "sub\tr1,r0" } } */
++  /* { dg-final { scan-assembler-not "sub\t0?4\\(sp\\),r0" } } */
++  /* The external one cannot be seen, so it keeps the stack
++     convention.  */
++  /* { dg-final { scan-assembler "jsr\tpc,_?ext" } } */
++  return loc (x, y) + ext (x, y);
++}
+diff -urN a/gcc/testsuite/gcc.target/pdp11/reg-args-2.c b/gcc/testsuite/gcc.target/pdp11/reg-args-2.c
+--- a/gcc/testsuite/gcc.target/pdp11/reg-args-2.c	1970-01-01 03:00:00
++++ b/gcc/testsuite/gcc.target/pdp11/reg-args-2.c	2026-10-12 20:07:20
+@@ -0,0 +1,15 @@
++/* { dg-do compile { target pdp11-*-* } } */
++/* { dg-options "-O2 -mno-reg-args" } */
++/* -mno-reg-args puts every argument back on the stack.  */
++
++static int __attribute__((noinline,noclone)) loc (int a, int b)
++{
++  return a - b;
++}
++
++int use (int x, int y)
++{
++  /* { dg-final { scan-assembler "sub\t0?4\\(sp\\),r0" } } */
++  /* { dg-final { scan-assembler-not "sub\tr1,r0" } } */
++  return loc (x, y);
++}
+diff -urN a/gcc/testsuite/gcc.target/pdp11/reg-args-3.c b/gcc/testsuite/gcc.target/pdp11/reg-args-3.c
+--- a/gcc/testsuite/gcc.target/pdp11/reg-args-3.c	1970-01-01 03:00:00
++++ b/gcc/testsuite/gcc.target/pdp11/reg-args-3.c	2026-10-12 20:07:20
+@@ -0,0 +1,25 @@
++/* { dg-do compile { target pdp11-*-* } } */
++/* { dg-options "-O2" } */
++/* Two kinds of local function that still take their arguments on the
++   stack: one whose address is taken, because the indirect call cannot
++   know anything else, and one with a variable argument list, which is
++   walked as one block of stack.  */
++
++static int __attribute__((noinline,noclone)) taken (int a, int b)
++{
++  return a - b;
++}
++
++static int __attribute__((noinline,noclone)) va (int n, ...)
++{
++  return n;
++}
++
++int (*volatile pf) (int, int) = taken;
++
++int use (int x, int y)
++{
++  /* { dg-final { scan-assembler "sub\t0?4\\(sp\\),r0" } } */
++  /* { dg-final { scan-assembler-not "sub\tr1,r0" } } */
++  return taken (x, y) + pf (x, y) + va (x, y);
++}
