@@ -19,19 +19,6 @@ SECTION_FLAGS:=-ffunction-sections -fdata-sections
 # -g is what puts DWARF in the C objects; -elf below does the same for
 # the MACRO-11 one.
 GCC_FLAGS:=-std=gnu23 -fomit-frame-pointer $(OPT_FLAG) $(SECTION_FLAGS) -g
-
-# Collecting what nothing reaches wanted two things of the linker before
-# a program built like this one could use it, and both are in
-# patches/binutils/0022.  The collection follows relocations, and it
-# follows them only through ELF objects: the call this program's EACHWD
-# makes to SHOWWD is in an RT-11 object module, nothing else calls that
-# function, and so its section went -- leaving a JSR into whatever took
-# its place, with no diagnostic.  And an input file's debug sections are
-# kept only when some section of that same file is kept, which a file
-# that is nothing but debug information never has, so mixasm.dbg went
-# whole and the MACRO-11 half's line numbers with it.  Now a symbol a
-# module in another format leaves undefined is a root, and a file with
-# no allocatable section keeps its DWARF.
 LD_FLAGS:=-Wl,--gc-sections
 
 # The ELF with it, not only the disk image: the symbols are the point
