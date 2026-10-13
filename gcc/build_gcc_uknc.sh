@@ -142,17 +142,26 @@ done
 # it, and that script is how the PPU side gets its symbols.  configure
 # switches Python off rather than stopping when the one it found cannot
 # be linked against, and the only sign is a line in config.log -- so a
-# rebuild loses PPU debugging without saying anything.  macOS is exactly
-# that case: /usr/bin/python3 is Apple's, and its python3-config reports
-# the framework as a relative path, which nothing can link.  Hence a
-# package manager's Python first, where there is one.  Where there is
-# not -- a distribution with python3-dev installed -- configure finds it
-# by itself and this adds nothing.
+# rebuild loses PPU debugging without saying anything.  Hence a package
+# manager's Python first, where there is one, and the system one after
+# them -- on a distribution with python3-dev installed that is what
+# configure would have found by itself anyway.
+#
+# Except on macOS, where the system one is Apple's: its python3-config
+# reports the framework as a relative path, which nothing can link, so
+# offering it to configure would lose Python just as quietly as offering
+# nothing.  There it is left out of the list altogether.
+SYSTEM_PYTHON="/usr/bin/python3"
+if [ "$(uname -s)" = "Darwin" ]; then
+	SYSTEM_PYTHON=""
+fi
+
 GDB_PYTHON=""
 for python in \
 	/opt/homebrew/opt/python@3*/bin/python3 \
 	/opt/local/bin/python3 \
-	/usr/local/opt/python@3*/bin/python3
+	/usr/local/opt/python@3*/bin/python3 \
+	${SYSTEM_PYTHON}
 do
 	if [ -x "${python}" ]; then
 		GDB_PYTHON="--with-python=${python}"
