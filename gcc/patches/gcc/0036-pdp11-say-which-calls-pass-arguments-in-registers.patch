@@ -1,0 +1,415 @@
+From: Yury Klushin <digger@live.ru>
+Date: Tue, 13 Oct 2026 14:00:00 +0300
+Subject: [PATCH] pdp11: say which calls pass arguments in registers
+
+The register convention reaches only a function the compiler can see
+every call to, which leaves out everything declared in a header,
+everything whose address is taken, every call through a pointer, and the
+whole C library -- all of them the places where a call is cheap enough
+for its arguments to be the cost.
+
+Two ways in, for the two kinds of case.
+
+A "regargs" attribute, and "noregargs" the other way, both on the
+function's type rather than on its declaration.  On the type, because
+then a pointer carries the convention with it and two types that
+disagree are not compatible: assigning a regargs function to a plain
+function pointer is a diagnostic, not a program that leaves its
+arguments where nobody looks.  TARGET_COMP_TYPE_ATTRIBUTES is what makes
+that so.  An indirect call through such a pointer passes in registers
+too, which no amount of looking at the call site could ever establish.
+A variable argument list refuses the attribute outright rather than
+quietly ignoring it, since the declaration and the definition would
+otherwise disagree about where the arguments are.
+
+And a list of names in the back end for the library's memory and string
+functions -- memcpy, memset, strlen and the rest of that set.  An
+attribute in a header cannot do this job: the compiler calls those
+functions itself, a structure assignment becoming a memcpy and a fill a
+memset, and it does so from units that may never have declared them, so
+half the calls would use one convention and half the other.  A name is
+the same everywhere, including when the library's own definition is
+compiled, which is what makes the two sides agree.  For that reason
+neither the list nor the attribute answers to -mreg-args: a library is
+built once, and a flag on one compilation must not be able to part it
+from its callers.
+
+What it is worth.  Three functions with the signatures of strlen, strcmp
+and memcpy, called twenty thousand times each: 167 frames against 184,
+so 45 ticks a call.  Against a run of the library's own strlen, memcpy,
+strcmp and memset over eight to twelve bytes -- 770 frames for eighty
+thousand calls -- that is about 3%, and more where the operands are
+shorter, nothing where the compiler expands the operation inline
+instead.  The attribute on a hot leaf function of one's own is worth a
+good deal more: with two int arguments, 94 frames against 116.
+
+The C library's convention is an ABI change: an object compiled before
+this and linked against a library built after it disagree about memcpy
+and its neighbours, with nothing to say so.  Both sides have to be
+built from the same toolchain -- which, the library being shipped with
+it, is what happens anyway.
+
+Tested with four new target tests and by rebuilding libgcc and newlib
+with it: the repository's own tests and examples pass, and a sample of
+120 gcc.c-torture/execute tests -- the va-arg, structure-passing and
+nested-function ones and the block beginning with 2 -- gives what it
+gave before, 115 passes and five that do not build on this target.
+
+---
+ gcc/config/pdp11/pdp11.cc                   |  166 +++++++++++++++++++++++++++-
+ gcc/doc/extend.texi                         |   32 +++++
+ gcc/doc/invoke.texi                         |   10 +
+ gcc/testsuite/gcc.target/pdp11/reg-args-4.c |   17 ++
+ gcc/testsuite/gcc.target/pdp11/reg-args-5.c |   20 +++
+ gcc/testsuite/gcc.target/pdp11/reg-args-6.c |   10 +
+ gcc/testsuite/gcc.target/pdp11/reg-args-7.c |   22 +++
+ 7 files changed, 274 insertions(+), 3 deletions(-)
+
+diff -urN a/gcc/config/pdp11/pdp11.cc b/gcc/config/pdp11/pdp11.cc
+--- a/gcc/config/pdp11/pdp11.cc	2026-10-13 13:33:59
++++ b/gcc/config/pdp11/pdp11.cc	2026-10-13 13:33:34
+@@ -219,6 +219,11 @@
+ #undef  TARGET_MD_ASM_ADJUST
+ #define TARGET_MD_ASM_ADJUST pdp11_md_asm_adjust
+ 
++#undef TARGET_ATTRIBUTE_TABLE
++#define TARGET_ATTRIBUTE_TABLE pdp11_attribute_table
++#undef TARGET_COMP_TYPE_ATTRIBUTES
++#define TARGET_COMP_TYPE_ATTRIBUTES pdp11_comp_type_attributes
++
+ #undef TARGET_FUNCTION_ARG
+ #define TARGET_FUNCTION_ARG pdp11_function_arg
+ #undef TARGET_FUNCTION_ARG_ADVANCE
+@@ -2363,6 +2368,147 @@
+   emit_move_insn (mem, fnaddr);
+ }
+ 
++/* The "regargs" and "noregargs" attributes say outright what
++   pdp11_arg_regs works out for itself otherwise, and they are the only
++   way to put the register convention on a call this unit cannot see
++   whole: a function from another unit, one whose address is taken, a
++   call through a pointer.  They sit on the function's type rather than
++   on its declaration, so that a pointer carries the convention with it
++   and a disagreement is a type error instead of a program that quietly
++   passes its arguments where nobody reads them.  */
++
++static const struct attribute_spec::exclusions attr_regargs_exclusions[] =
++{
++  /* Attribute name, function, type, variable.  */
++  { "noregargs", true, true, true },
++  { NULL, false, false, false }
++};
++
++static const struct attribute_spec::exclusions attr_noregargs_exclusions[] =
++{
++  { "regargs", true, true, true },
++  { NULL, false, false, false }
++};
++
++static tree
++pdp11_handle_regargs_attribute (tree *node, tree name, tree, int,
++				bool *no_add_attrs)
++{
++  tree type = *node;
++
++  if (TREE_CODE (type) != FUNCTION_TYPE
++      && TREE_CODE (type) != FIELD_DECL
++      && TREE_CODE (type) != TYPE_DECL)
++    {
++      warning (OPT_Wattributes, "%qE attribute only applies to functions",
++	       name);
++      *no_add_attrs = true;
++      return NULL_TREE;
++    }
++
++  /* A variable argument list is walked as one block of stack, so the
++     named arguments in front of it cannot start in registers.  Said out
++     loud rather than ignored: the declaration and the definition would
++     otherwise disagree about where the arguments are.  */
++  if (is_attribute_p ("regargs", name)
++      && TREE_CODE (type) == FUNCTION_TYPE
++      && stdarg_p (type))
++    {
++      error ("%qE attribute is not supported with a variable argument list",
++	     name);
++      *no_add_attrs = true;
++    }
++
++  return NULL_TREE;
++}
++
++TARGET_GNU_ATTRIBUTES (pdp11_attribute_table,
++{
++  /* { name, min_num_args, max_num_args, decl_req, type_req, fn_type_req,
++       affects_type_identity, handler, exclude } */
++  { "regargs",   0, 0, false, true, true, true,
++    pdp11_handle_regargs_attribute, attr_regargs_exclusions },
++  { "noregargs", 0, 0, false, true, true, true,
++    pdp11_handle_regargs_attribute, attr_noregargs_exclusions }
++});
++
++/* What a function type says about the register convention: the size of
++   the window, or -1 when it says nothing and pdp11_arg_regs is left to
++   work it out from the call itself.  */
++
++static int
++pdp11_declared_arg_regs (const_tree fntype)
++{
++  if (fntype == NULL_TREE)
++    return -1;
++  if (lookup_attribute ("noregargs", TYPE_ATTRIBUTES (fntype)))
++    return 0;
++  if (lookup_attribute ("regargs", TYPE_ATTRIBUTES (fntype)))
++    return PDP11_NARGREGS;
++  return -1;
++}
++
++/* Worker function for TARGET_COMP_TYPE_ATTRIBUTES.
++
++   Two function types are compatible only where they pass their
++   arguments the same way, so that a pointer to one cannot be used to
++   call the other.  */
++
++static int
++pdp11_comp_type_attributes (const_tree type1, const_tree type2)
++{
++  return pdp11_declared_arg_regs (type1) == pdp11_declared_arg_regs (type2);
++}
++
++/* The library functions whose argument convention is settled here
++   rather than worked out from the call.  Two reasons they cannot be
++   left to the attribute above.  The compiler calls some of them by
++   itself -- a structure assignment becomes memcpy, a fill becomes
++   memset -- and it does so from units that may never have seen a
++   declaration of them, so a convention carried by a header would not
++   reach those calls.  And a library is built once: the convention must
++   be the same wherever the name turns up, which is what a list of names
++   says and what an option cannot.  Both sides agree for the same
++   reason -- the definition in the library is recognised by its own name
++   when it is compiled.
++
++   The list is the hot memory and string set: arguments that are words
++   and pointers, and bodies short enough for the call itself to show in
++   a profile.  */
++
++static bool
++pdp11_regargs_libfunc_p (const_tree fndecl)
++{
++  static const char *const names[] = {
++    "memchr", "memcmp", "memcpy", "memmove", "memset",
++    "strcat", "strchr", "strcmp", "strcpy", "strlen",
++    "strncat", "strncmp", "strncpy", "strnlen", "strrchr"
++  };
++  tree id;
++  const char *name;
++  size_t i;
++
++  if (fndecl == NULL_TREE || TREE_CODE (fndecl) != FUNCTION_DECL)
++    return false;
++
++  id = DECL_NAME (fndecl);
++  if (id == NULL_TREE)
++    return false;
++
++  /* The name as written, and the same name behind __builtin_: a call
++     the compiler puts there itself arrives as the built-in function, and
++     it is the library's one that answers it.  */
++  name = IDENTIFIER_POINTER (id);
++  if (strncmp (name, "__builtin_", strlen ("__builtin_")) == 0)
++    name += strlen ("__builtin_");
++
++  for (i = 0; i < ARRAY_SIZE (names); i++)
++    if (strcmp (name, names[i]) == 0)
++      return true;
++
++  return false;
++}
++
+ /* How many words of a call's arguments may be handed over in
+    registers: PDP11_NARGREGS, or none at all.
+ 
+@@ -2386,13 +2532,27 @@
+ pdp11_arg_regs (const_tree fntype, const_tree fndecl)
+ {
+   cgraph_node *node;
++  int declared;
+ 
+-  if (fndecl == NULL_TREE || TREE_CODE (fndecl) != FUNCTION_DECL)
+-    return 0;
+-
+   /* A variable argument list is walked as one block of stack, so the
+      named arguments in front of it cannot start in registers.  */
+   if (fntype != NULL_TREE && stdarg_p (fntype))
++    return 0;
++
++  /* One of the library functions above: fixed, and for the same reason
++     not open to -mreg-args or to an attribute either.  */
++  if (pdp11_regargs_libfunc_p (fndecl))
++    return PDP11_NARGREGS;
++
++  /* Declared outright: that is the convention, whatever the call looks
++     like from here and whatever -mreg-args says.  A declaration and the
++     object built from it have to agree, and a flag on one of the two
++     compilations must not be able to part them.  */
++  declared = pdp11_declared_arg_regs (fntype);
++  if (declared >= 0)
++    return declared;
++
++  if (fndecl == NULL_TREE || TREE_CODE (fndecl) != FUNCTION_DECL)
+     return 0;
+ 
+   node = cgraph_node::get (fndecl);
+diff -urN a/gcc/doc/extend.texi b/gcc/doc/extend.texi
+--- a/gcc/doc/extend.texi	2026-10-13 13:33:34
++++ b/gcc/doc/extend.texi	2026-10-13 13:33:34
+@@ -1697,6 +1697,7 @@
+ * MSP430 Function Attributes::
+ * NDS32 Function Attributes::
+ * Nvidia PTX Function Attributes::
++* PDP-11 Function Attributes::
+ * PowerPC Function Attributes::
+ * RISC-V Function Attributes::
+ * RL78 Function Attributes::
+@@ -5402,6 +5403,37 @@
+ By default functions are only callable only from other PTX functions.
+ 
+ Kernel functions must have @code{void} return type.
++@end table
++
++@node PDP-11 Function Attributes
++@subsubsection PDP-11 Function Attributes
++
++These function attributes are supported by the PDP-11 back end:
++
++@table @code
++@cindex @code{regargs} function attribute, PDP-11
++@cindex @code{noregargs} function attribute, PDP-11
++@item regargs
++@itemx noregargs
++On this target the first two words of a call's arguments are passed in
++R0 and R1 where the compiler can see every call to the function -- see
++@option{-mreg-args} in @ref{PDP-11 Options} -- and on the stack
++otherwise.  These attributes say which convention to use outright, which
++is the only way to have the register one where the compiler cannot see
++the calls: a function from another translation unit, a function whose
++address is taken, or a call through a pointer.
++
++They belong to the function's type rather than to its declaration, so a
++pointer carries the convention with it and two types that disagree are
++not compatible -- assigning a @code{regargs} function to a plain
++function pointer is an error rather than a program that passes its
++arguments where nobody reads them.  For the same reason a declaration
++and the definition built from it must both carry the attribute.
++
++@code{regargs} cannot be used on a function with a variable argument
++list.  Neither attribute is affected by @option{-mno-reg-args}: a
++library and its header have to agree whatever flags either side is
++compiled with.
+ @end table
+ 
+ @node PowerPC Function Attributes
+diff -urN a/gcc/doc/invoke.texi b/gcc/doc/invoke.texi
+--- a/gcc/doc/invoke.texi	2026-10-13 13:33:34
++++ b/gcc/doc/invoke.texi	2026-10-13 13:33:34
+@@ -30955,6 +30955,16 @@
+ else keeps the standard convention, in which all arguments are pushed on
+ the stack.  This is the default; @option{-mno-reg-args} passes every
+ argument on the stack.
++
++Two things this option does not reach.  A function whose type carries
++the @code{regargs} or @code{noregargs} attribute (@pxref{PDP-11
++Function Attributes}) keeps what the attribute says, and so do the
++memory and string functions of the C library -- @code{memcpy},
++@code{memset}, @code{strlen} and the rest of that set -- which pass
++their first two words in registers always.  The compiler emits calls to
++those itself, from translation units that may never have declared them,
++so their convention cannot depend on what is visible or on how one side
++was compiled.
+ @end table
+ 
+ @node PowerPC Options
+diff -urN a/gcc/testsuite/gcc.target/pdp11/reg-args-4.c b/gcc/testsuite/gcc.target/pdp11/reg-args-4.c
+--- a/gcc/testsuite/gcc.target/pdp11/reg-args-4.c	1970-01-01 03:00:00
++++ b/gcc/testsuite/gcc.target/pdp11/reg-args-4.c	2026-10-13 13:33:34
+@@ -0,0 +1,17 @@
++/* { dg-do compile { target pdp11-*-* } } */
++/* { dg-options "-O2" } */
++/* The attribute puts the register convention on a call the compiler
++   cannot see whole: a function from another unit.  */
++
++extern int att (int a, int b) __attribute__((regargs));
++extern int plain (int a, int b);
++
++int use (int x, int y)
++{
++  /* The attributed one takes its arguments in R0 and R1 ... */
++  /* { dg-final { scan-assembler "mov\t0?6\\(sp\\),r1" } } */
++  /* ... and the plain one has both of its pushed instead.  */
++  /* { dg-final { scan-assembler "jsr\tpc,_?plain" } } */
++  /* { dg-final { scan-assembler "mov\t0?6\\(sp\\),-\\(sp\\)" } } */
++  return att (x, y) + plain (x, y);
++}
+diff -urN a/gcc/testsuite/gcc.target/pdp11/reg-args-5.c b/gcc/testsuite/gcc.target/pdp11/reg-args-5.c
+--- a/gcc/testsuite/gcc.target/pdp11/reg-args-5.c	1970-01-01 03:00:00
++++ b/gcc/testsuite/gcc.target/pdp11/reg-args-5.c	2026-10-13 13:33:34
+@@ -0,0 +1,20 @@
++/* { dg-do compile { target pdp11-*-* } } */
++/* { dg-options "-O2" } */
++/* The attribute is part of the type, so a pointer carries it and the
++   indirect call passes in registers too -- which the automatic rule can
++   never do, a function whose address is taken not being local.  */
++
++static int __attribute__((noinline,noclone,regargs)) taken (int a, int b)
++{
++  return a - b;
++}
++
++int (*volatile pf) (int, int) __attribute__((regargs)) = taken;
++
++int use (int x, int y)
++{
++  /* { dg-final { scan-assembler "sub\tr1,r0" } } */
++  /* { dg-final { scan-assembler "jsr\tpc,@_?pf" } } */
++  /* { dg-final { scan-assembler-not "mov\tr\[01\],-\\(sp\\)" } } */
++  return pf (x, y);
++}
+diff -urN a/gcc/testsuite/gcc.target/pdp11/reg-args-6.c b/gcc/testsuite/gcc.target/pdp11/reg-args-6.c
+--- a/gcc/testsuite/gcc.target/pdp11/reg-args-6.c	1970-01-01 03:00:00
++++ b/gcc/testsuite/gcc.target/pdp11/reg-args-6.c	2026-10-13 13:33:34
+@@ -0,0 +1,10 @@
++/* { dg-do compile { target pdp11-*-* } } */
++/* { dg-options "-O2" } */
++/* Two types that pass their arguments differently are not compatible,
++   and a variable argument list cannot start in registers at all.  */
++
++extern int att (int a, int b) __attribute__((regargs));
++
++int (*p) (int, int) = att;   /* { dg-error "incompatible pointer type" } */
++
++extern int v (int n, ...) __attribute__((regargs)); /* { dg-error "variable argument list" } */
+diff -urN a/gcc/testsuite/gcc.target/pdp11/reg-args-7.c b/gcc/testsuite/gcc.target/pdp11/reg-args-7.c
+--- a/gcc/testsuite/gcc.target/pdp11/reg-args-7.c	1970-01-01 03:00:00
++++ b/gcc/testsuite/gcc.target/pdp11/reg-args-7.c	2026-10-13 13:33:34
+@@ -0,0 +1,22 @@
++/* { dg-do compile { target pdp11-*-* } } */
++/* { dg-options "-O2" } */
++/* The C library's memory and string functions pass their first two
++   words in registers wherever the name appears, with no attribute and
++   no declaration in sight: the compiler calls them itself, from units
++   that may never have declared them.  */
++
++void *fill (void *p, unsigned n)
++{
++  /* { dg-final { scan-assembler "clr\tr1" } } */
++  /* { dg-final { scan-assembler "jsr\tpc,_?memset" } } */
++  return __builtin_memset (p, 0, n);
++}
++
++unsigned len (const char *s)
++{
++  /* The only argument goes in R0, and nothing is pushed for it.  */
++  /* { dg-final { scan-assembler "mov\t0?2\\(sp\\),r0" } } */
++  /* { dg-final { scan-assembler "jsr\tpc,_?strlen" } } */
++  /* { dg-final { scan-assembler-not "mov\t0?2\\(sp\\),-\\(sp\\)" } } */
++  return __builtin_strlen (s);
++}
