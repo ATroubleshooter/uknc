@@ -29,6 +29,26 @@ set -e
 # wanted back; the two produce byte-identical programs as long as
 # --gc-sections is off, which is how the change was checked.
 
+# What the build needs from the host, looked for before anything is
+# downloaded or built rather than an hour into it.  Most of these speak
+# for themselves; four do not.  bison and flex are gdb's: it is built
+# from a clone rather than a release, so its parsers arrive as .y and .l
+# files and are generated here.  m4 and perl are for the autoconf 2.69
+# and automake 1.15.1 that this script builds for itself further down,
+# and for the autoreconf that regenerates newlib's configure with them.
+#
+# GMP, MPFR and MPC are deliberately not in the list: where the host has
+# them they get used, and where it does not gcc fetches its own.
+missing=""
+for tool in curl tar patch make git bison flex m4 perl ${CC:-cc} ${CXX:-c++}; do
+	command -v "${tool}" > /dev/null 2>&1 || missing="${missing} ${tool}"
+done
+if [ -n "${missing}" ]; then
+	echo "$0: needed and not found:${missing}" >&2
+	echo "$0: install them, then run this again" >&2
+	exit 1
+fi
+
 BINUTILS_VERSION="2.45"
 GCC_VERSION="15.2.0"
 NEWLIB_VERSION="4.6.0.20260123"
